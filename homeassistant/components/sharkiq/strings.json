@@ -36,6 +36,12 @@
   "exceptions": {
     "invalid_room": {
       "message": "The room {room} is unavailable to your vacuum. Make sure all rooms match the SharkClean app, including capitalization."
+    },
+    "invalid_fan_speed": {
+      "message": "Fan speed {fan_speed} is not supported. Use one of: Eco, Normal, Max."
+    },
+    "empty_room_queue": {
+      "message": "No rooms are queued for cleaning. Toggle one or more 'Queue …' switches first."
     }
   },
   "selector": {
@@ -51,11 +57,42 @@
       "description": "Cleans a specific user-defined room or set of rooms.",
       "fields": {
         "rooms": {
-          "description": "List of rooms to clean",
+          "description": "List of rooms to clean. Pre-populated from your device's room map; pick one or more.",
           "name": "Rooms"
+        },
+        "clean_type": {
+          "description": "Cleaning mode (newer hybrid devices only). 'dry' vacuums, 'wet' uses the mop pad, 'matrix' is a denser pattern, 'spot' focuses on a small area.",
+          "name": "Clean type"
+        },
+        "fan_speed": {
+          "description": "Suction power applied before the clean starts. Eco, Normal, or Max.",
+          "name": "Fan speed"
         }
       },
       "name": "Clean room"
+    }
+  },
+  "entity": {
+    "button": {
+      "start_room_clean": {
+        "name": "Start room clean"
+      }
+    },
+    "select": {
+      "clean_type": {
+        "name": "Clean mode",
+        "state": {
+          "dry": "Dry vacuum",
+          "wet": "Wet mop",
+          "matrix": "Matrix",
+          "spot": "Spot"
+        }
+      }
+    },
+    "switch": {
+      "queue_room": {
+        "name": "Queue {room}"
+      }
     }
   }
 }

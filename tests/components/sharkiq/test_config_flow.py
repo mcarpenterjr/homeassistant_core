@@ -7,6 +7,7 @@ import pytest
 from sharkiq import AylaApi, SharkIqAuthError, SharkIqError
 
 from homeassistant import config_entries
+from homeassistant.components.sharkiq.auth import SharkAuthError
 from homeassistant.components.sharkiq.const import DOMAIN
 from homeassistant.core import HomeAssistant
 from homeassistant.data_entry_flow import FlowResultType
@@ -47,8 +48,10 @@ async def test_form(hass: HomeAssistant) -> None:
     assert result["errors"] == {}
 
     with (
-        patch("sharkiq.AylaApi.async_sign_in", return_value=True),
-        patch("sharkiq.AylaApi.async_set_cookie"),
+        patch(
+            "homeassistant.components.sharkiq.config_flow.SharkAuth.async_sign_in",
+            return_value=None,
+        ),
         patch(
             "homeassistant.components.sharkiq.async_setup_entry",
             return_value=True,
@@ -71,6 +74,33 @@ async def test_form(hass: HomeAssistant) -> None:
     mock_setup_entry.assert_called_once()
 
 
+async def test_form_auth0_fails_ayla_succeeds(hass: HomeAssistant) -> None:
+    """Test that Ayla fallback works when Auth0 direct auth fails."""
+    result = await hass.config_entries.flow.async_init(
+        DOMAIN, context={"source": config_entries.SOURCE_USER}
+    )
+
+    with (
+        patch(
+            "homeassistant.components.sharkiq.config_flow.SharkAuth.async_sign_in",
+            side_effect=SharkAuthError("Auth0 failed"),
+        ),
+        patch("sharkiq.AylaApi.async_sign_in", return_value=True),
+        patch("sharkiq.AylaApi.async_set_cookie"),
+        patch(
+            "homeassistant.components.sharkiq.async_setup_entry",
+            return_value=True,
+        ) as mock_setup_entry,
+    ):
+        result2 = await hass.config_entries.flow.async_configure(
+            result["flow_id"],
+            CONFIG,
+        )
+
+    assert result2["type"] is FlowResultType.CREATE_ENTRY
+    mock_setup_entry.assert_called_once()
+
+
 @pytest.mark.parametrize(
     ("exc", "base_error"),
     [
@@ -87,6 +117,10 @@ async def test_form_error(hass: HomeAssistant, exc: Exception, base_error: str) 
     )
 
     with (
+        patch(
+            "homeassistant.components.sharkiq.config_flow.SharkAuth.async_sign_in",
+            side_effect=SharkAuthError("Auth0 failed"),
+        ),
         patch.object(AylaApi, "async_sign_in", side_effect=exc),
         patch("sharkiq.AylaApi.async_set_cookie"),
     ):
@@ -106,9 +140,9 @@ async def test_reauth_success(hass: HomeAssistant) -> None:
 
     result = await mock_config.start_reauth_flow(hass)
 
-    with (
-        patch("sharkiq.AylaApi.async_sign_in", return_value=True),
-        patch("sharkiq.AylaApi.async_set_cookie"),
+    with patch(
+        "homeassistant.components.sharkiq.config_flow.SharkAuth.async_sign_in",
+        return_value=None,
     ):
         result = await hass.config_entries.flow.async_configure(
             result["flow_id"], user_input=CONFIG
@@ -141,6 +175,10 @@ async def test_reauth(
     result = await mock_config.start_reauth_flow(hass)
 
     with (
+        patch(
+            "homeassistant.components.sharkiq.config_flow.SharkAuth.async_sign_in",
+            side_effect=SharkAuthError("Auth0 failed"),
+        ),
         patch("sharkiq.AylaApi.async_sign_in", side_effect=side_effect),
         patch("sharkiq.AylaApi.async_set_cookie"),
     ):

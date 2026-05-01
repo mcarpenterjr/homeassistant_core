@@ -9,7 +9,30 @@ clean_room:
       required: true
       advanced: false
       example: "Kitchen"
-      default: ""
       selector:
-        area:
+        select:
+          options: []
           multiple: true
+          custom_value: true
+    clean_type:
+      required: false
+      advanced: false
+      example: "dry"
+      default: "dry"
+      selector:
+        select:
+          options:
+            - "dry"
+            - "wet"
+            - "matrix"
+            - "spot"
+    fan_speed:
+      required: false
+      advanced: false
+      example: "Normal"
+      selector:
+        select:
+          options:
+            - "Eco"
+            - "Normal"
+            - "Max"

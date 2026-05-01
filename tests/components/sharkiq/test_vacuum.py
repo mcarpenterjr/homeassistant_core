@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Iterable
 from copy import deepcopy
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import enum
 from typing import Any
 from unittest.mock import patch
@@ -149,8 +149,12 @@ async def setup_integration(hass: HomeAssistant) -> None:
         domain=DOMAIN, unique_id=TEST_USERNAME, data=CONFIG, entry_id=ENTRY_ID
     )
     entry.add_to_hass(hass)
-    await hass.config_entries.async_setup(entry.entry_id)
-    await hass.async_block_till_done()
+    with patch(
+        "homeassistant.components.sharkiq._async_setup_skegox",
+        return_value=None,
+    ):
+        await hass.config_entries.async_setup(entry.entry_id)
+        await hass.async_block_till_done()
 
 
 async def test_simple_properties(
@@ -289,12 +293,25 @@ async def test_clean_room(hass: HomeAssistant, room_list: list) -> None:
 async def test_coordinator_updates(
     hass: HomeAssistant, side_effect: Exception | None, success: bool
 ) -> None:
-    """Test the update coordinator update functions."""
+    """Test the update coordinator update functions.
+
+    The vacuum entity now keeps itself available for a grace window after
+    the last successful refresh, so simulating a failure right after a
+    successful setup wouldn't flip the state. To exercise the failure
+    path we backdate the coordinator's success timestamp before the
+    failing call.
+    """
     entry = hass.config_entries.async_get_entry(ENTRY_ID)
     assert entry is not None
     coordinator = entry.runtime_data
 
     await async_setup_component(hass, HOMEASSISTANT_DOMAIN, {})
+
+    if not success:
+        # Force the grace window to be exhausted so the failure flips state.
+        coordinator.last_update_success_time = datetime.now(timezone.utc) - timedelta(
+            hours=1
+        )
 
     with patch.object(
         MockShark, "async_update", side_effect=side_effect

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Mapping
+import socket
 from typing import Any
 
 import aiohttp
@@ -17,6 +18,7 @@ from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers import selector
 from homeassistant.helpers.aiohttp_client import async_create_clientsession
 
+from .auth import SharkAuth, SharkAuthError
 from .const import (
     DOMAIN,
     LOGGER,
@@ -43,16 +45,40 @@ SHARKIQ_SCHEMA = vol.Schema(
 async def _validate_input(
     hass: HomeAssistant, data: Mapping[str, Any]
 ) -> dict[str, str]:
-    """Validate the user input allows us to connect."""
-    new_websession = async_create_clientsession(
+    """Validate the user input allows us to connect.
+
+    Tries Auth0 direct auth first (for skegox), falls back to sharkiq library (Ayla).
+    """
+    europe = data.get(CONF_REGION) == SHARKIQ_REGION_EUROPE
+    websession = async_create_clientsession(
         hass,
         cookie_jar=aiohttp.CookieJar(unsafe=True, quote_cookie=False),
+        family=socket.AF_INET,
     )
+
+    # Try Auth0 direct authentication first (works for both backends)
+    try:
+        async with asyncio.timeout(15):
+            auth = SharkAuth(
+                username=data[CONF_USERNAME],
+                password=data[CONF_PASSWORD],
+                websession=websession,
+                europe=europe,
+            )
+            await auth.async_sign_in()
+            LOGGER.debug("Auth0 direct authentication successful")
+            return {"title": data[CONF_USERNAME]}
+    except SharkAuthError as err:
+        LOGGER.debug("Auth0 direct auth failed: %s, trying Ayla fallback", err)
+    except TimeoutError:
+        LOGGER.debug("Auth0 direct auth timed out, trying Ayla fallback")
+
+    # Fall back to sharkiq library's auth (legacy Ayla path)
     ayla_api = get_ayla_api(
         username=data[CONF_USERNAME],
         password=data[CONF_PASSWORD],
-        websession=new_websession,
-        europe=(data[CONF_REGION] == SHARKIQ_REGION_EUROPE),
+        websession=websession,
+        europe=europe,
     )
 
     try:
@@ -62,12 +88,12 @@ async def _validate_input(
     except (TimeoutError, aiohttp.ClientError, TypeError) as error:
         LOGGER.error(error)
         raise CannotConnect(
-            "Unable to connect to SharkIQ services.  Check your region settings."
+            "Unable to connect to SharkIQ services. Check your region settings."
         ) from error
     except SharkIqAuthError as error:
         LOGGER.error(error)
         raise InvalidAuth(
-            "Username or password incorrect.  Please check your credentials."
+            "Username or password incorrect. Please check your credentials."
         ) from error
     except Exception as error:
         LOGGER.exception("Unexpected exception")

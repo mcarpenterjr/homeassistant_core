@@ -1,18 +1,43 @@
-"""Composer 'Start room clean' button for Shark IQ vacuums."""
+"""Per-preset 'Clean rooms' buttons for Shark IQ vacuums.
+
+Each cleaning preset configured in the integration's options flow becomes
+a button on the vacuum's device card. Pressing the button dispatches the
+``sharkiq.clean_room`` service against the target vacuum with the rooms,
+clean mode, and fan speed bundled in the preset, so all the room-cleaning
+logic lives in one place (the service / vacuum entity method) and the
+button is just a one-tap shortcut.
+"""
 
 from __future__ import annotations
 
-from collections.abc import Iterable
+from typing import Any
 
 from homeassistant.components.button import ButtonEntity
+from homeassistant.components.vacuum import DOMAIN as VACUUM_DOMAIN
 from homeassistant.core import HomeAssistant
-from homeassistant.exceptions import ServiceValidationError
+from homeassistant.exceptions import HomeAssistantError
+from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
-from .const import DOMAIN, LOGGER, SHARK
+from .const import (
+    ATTR_CLEAN_TYPE,
+    ATTR_FAN_SPEED,
+    ATTR_ROOMS,
+    CONF_PRESETS,
+    DOMAIN,
+    LOGGER,
+    PRESET_CLEAN_TYPE,
+    PRESET_FAN_SPEED,
+    PRESET_ID,
+    PRESET_NAME,
+    PRESET_ROOMS,
+    PRESET_SERIAL,
+    SHARK,
+)
 from .coordinator import SharkDevice, SharkIqConfigEntry, SharkIqUpdateCoordinator
+from .services import SERVICE_CLEAN_ROOM
 
 
 async def async_setup_entry(
@@ -20,29 +45,46 @@ async def async_setup_entry(
     config_entry: SharkIqConfigEntry,
     async_add_entities: AddConfigEntryEntitiesCallback,
 ) -> None:
-    """Create one start-clean button per Shark IQ vacuum."""
+    """Create one button per configured cleaning preset."""
     coordinator = config_entry.runtime_data
-    devices: Iterable[SharkDevice] = coordinator.shark_vacs.values()
-    async_add_entities(SharkStartRoomCleanButton(d, coordinator) for d in devices)
+    presets = config_entry.options.get(CONF_PRESETS, [])
+    entities: list[SharkPresetCleanButton] = []
+    for preset in presets:
+        serial = preset.get(PRESET_SERIAL)
+        device = coordinator.shark_vacs.get(serial)
+        if device is None:
+            LOGGER.debug(
+                "Skipping preset %s: target vacuum %s not in this entry",
+                preset.get(PRESET_NAME),
+                serial,
+            )
+            continue
+        entities.append(SharkPresetCleanButton(device, coordinator, preset))
+    if entities:
+        async_add_entities(entities)
 
 
-class SharkStartRoomCleanButton(
+class SharkPresetCleanButton(
     CoordinatorEntity[SharkIqUpdateCoordinator], ButtonEntity
 ):
-    """Press to start a clean of all rooms currently toggled in the queue."""
+    """One-tap clean of the rooms bundled in a user-defined preset."""
 
     _attr_has_entity_name = True
-    _attr_translation_key = "start_room_clean"
-    _attr_icon = "mdi:play-circle"
+    _attr_icon = "mdi:robot-vacuum"
 
     def __init__(
-        self, sharkiq: SharkDevice, coordinator: SharkIqUpdateCoordinator
+        self,
+        sharkiq: SharkDevice,
+        coordinator: SharkIqUpdateCoordinator,
+        preset: dict[str, Any],
     ) -> None:
-        """Initialize the start button."""
+        """Initialize a preset clean button."""
         super().__init__(coordinator)
         self._sharkiq = sharkiq
-        self._attr_unique_id = f"{sharkiq.serial_number}_start_room_clean"
-        self._attr_name = "Start room clean"
+        self._preset = preset
+        preset_id = preset.get(PRESET_ID) or preset.get(PRESET_NAME, "preset")
+        self._attr_unique_id = f"{sharkiq.serial_number}_preset_{preset_id}"
+        self._attr_name = f"Clean {preset.get(PRESET_NAME, 'preset')}"
         self._attr_device_info = DeviceInfo(
             identifiers={(DOMAIN, sharkiq.serial_number)},
             manufacturer=SHARK,
@@ -51,30 +93,50 @@ class SharkStartRoomCleanButton(
 
     @property
     def available(self) -> bool:
-        """Available when the vacuum is online and we've had a recent success."""
+        """Available when the vacuum is online and we've had a recent success.
+
+        Uses the coordinator's grace-windowed success flag so a single
+        failed poll on a flaky network doesn't yank the button out from
+        under the user — matches ``vacuum.SharkVacuumEntity.available``.
+        """
         return (
             self.coordinator.has_recent_success
             and self.coordinator.device_is_online(self._sharkiq.serial_number)
         )
 
     async def async_press(self) -> None:
-        """Trigger a clean of every room currently queued."""
-        dsn = self._sharkiq.serial_number
-        queued = sorted(self.coordinator.room_queue.get(dsn, set()))
-        if not queued:
-            raise ServiceValidationError(
-                translation_domain=DOMAIN,
-                translation_key="empty_room_queue",
+        """Trigger a clean of the preset's rooms via the clean_room service."""
+        rooms = list(self._preset.get(PRESET_ROOMS) or [])
+        if not rooms:
+            raise HomeAssistantError(
+                f"Preset '{self._preset.get(PRESET_NAME)}' has no rooms configured"
             )
-        clean_type = self.coordinator.clean_type.get(dsn, "dry")
-        LOGGER.debug(
-            "Starting room clean for %s: rooms=%s clean_type=%s",
-            self._sharkiq.name,
-            queued,
-            clean_type,
+
+        registry = er.async_get(self.hass)
+        vacuum_entity_id = registry.async_get_entity_id(
+            VACUUM_DOMAIN, DOMAIN, self._sharkiq.serial_number
         )
-        if self.coordinator.is_skegox:
-            await self._sharkiq.async_clean_rooms(queued, clean_type=clean_type)
-        else:
-            await self._sharkiq.async_clean_rooms(queued)
-        await self.coordinator.async_refresh()
+        if vacuum_entity_id is None:
+            raise HomeAssistantError(
+                f"Vacuum entity for {self._sharkiq.name} not found"
+            )
+
+        service_data: dict[str, Any] = {ATTR_ROOMS: rooms}
+        if (clean_type := self._preset.get(PRESET_CLEAN_TYPE)):
+            service_data[ATTR_CLEAN_TYPE] = clean_type
+        if (fan_speed := self._preset.get(PRESET_FAN_SPEED)):
+            service_data[ATTR_FAN_SPEED] = fan_speed
+
+        LOGGER.debug(
+            "Pressing preset button %s for %s: %s",
+            self._preset.get(PRESET_NAME),
+            self._sharkiq.name,
+            service_data,
+        )
+        await self.hass.services.async_call(
+            DOMAIN,
+            SERVICE_CLEAN_ROOM,
+            service_data,
+            target={"entity_id": vacuum_entity_id},
+            blocking=True,
+        )

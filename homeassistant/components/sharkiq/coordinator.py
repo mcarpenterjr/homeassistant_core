@@ -59,16 +59,6 @@ class SharkIqUpdateCoordinator(DataUpdateCoordinator[bool]):
         # apply a grace period to availability so transient SharkNinja /
         # network failures don't flap the entity unavailable.
         self.last_update_success_time: datetime | None = None
-        # Per-device "selected rooms" queue and clean mode used by the
-        # composer entities (room switches + clean-mode select + start
-        # button). The switch and select entities seed these from
-        # RestoreEntity on startup; the start button reads them.
-        self.room_queue: dict[str, set[str]] = {
-            vac.serial_number: set() for vac in shark_vacs
-        }
-        self.clean_type: dict[str, str] = {
-            vac.serial_number: "dry" for vac in shark_vacs
-        }
 
         super().__init__(
             hass,

@@ -277,25 +277,41 @@ def _async_remove_orphan_entities(
 ) -> None:
     """Drop entity-registry rows for unique_ids we no longer create.
 
-    The integration previously created one ``button.<vac>_clean_<room>``
-    entity per device room. Those have been replaced by the queue switches
-    + start button + clean-mode select composer pattern. Without explicit
-    cleanup the old buttons linger in the registry forever and clutter
-    every device card.
+    The integration has gone through three room-cleaning UX iterations:
+
+    1. One ``button.<vac>_clean_<room>`` per room — replaced in iteration 2.
+    2. Queue switches + clean-mode select + single start button — replaced
+       in iteration 3 because the composer was clunky to use on a Lovelace
+       card.
+    3. Per-preset buttons configured via the options flow (current).
+
+    Without explicit cleanup, registry rows from prior iterations linger
+    forever and clutter every device card. We match by unique_id prefix
+    so we don't accidentally remove the new ``{serial}_preset_...`` rows.
     """
     registry = er.async_get(hass)
     entries = er.async_entries_for_config_entry(registry, config_entry.entry_id)
     serials = set(coordinator.shark_vacs)
+    # (entity_domain, unique_id_substring) — substring lookup keeps us safe
+    # when prefix shapes shift (e.g. "{serial}_clean_<room>" vs
+    # "{serial}_start_room_clean").
+    stale_substrings_by_domain: dict[str, tuple[str, ...]] = {
+        "button": ("_clean_", "_start_room_clean"),
+        "select": ("_clean_type",),
+        "switch": ("_queue_",),
+    }
     for entry in entries:
-        # Old per-room button pattern was "{serial}_clean_{room}". The new
-        # platforms use distinct prefixes (queue_, start_room_clean,
-        # clean_type) so this match is specific to the obsolete buttons.
-        if entry.domain != "button":
+        substrings = stale_substrings_by_domain.get(entry.domain)
+        if substrings is None:
             continue
         unique_id = entry.unique_id or ""
+        # Skip new-style preset buttons even though they share a domain.
+        if "_preset_" in unique_id:
+            continue
         for serial in serials:
-            stale_prefix = f"{serial}_clean_"
-            if unique_id.startswith(stale_prefix):
+            if not unique_id.startswith(serial):
+                continue
+            if any(s in unique_id for s in substrings):
                 LOGGER.debug(
                     "Removing orphan sharkiq entity %s (%s)",
                     entry.entity_id,
@@ -325,13 +341,6 @@ async def async_disconnect_or_timeout(coordinator: SharkIqUpdateCoordinator) -> 
                 SharkIqAuthError, SharkIqAuthExpiringError, SharkIqNotAuthedError
             ):
                 await coordinator.ayla_api.async_sign_out()
-
-
-async def async_update_options(
-    hass: HomeAssistant, config_entry: SharkIqConfigEntry
-) -> None:
-    """Update options."""
-    await hass.config_entries.async_reload(config_entry.entry_id)
 
 
 async def async_unload_entry(

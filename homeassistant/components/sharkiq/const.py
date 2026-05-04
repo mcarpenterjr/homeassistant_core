@@ -8,7 +8,7 @@ from homeassistant.const import Platform
 LOGGER = logging.getLogger(__package__)
 
 API_TIMEOUT = 20
-PLATFORMS = [Platform.BUTTON, Platform.SELECT, Platform.SWITCH, Platform.VACUUM]
+PLATFORMS = [Platform.BUTTON, Platform.VACUUM]
 DOMAIN = "sharkiq"
 SHARK = "Shark"
 # Default poll cadence used while the vacuum is actively cleaning or returning.
@@ -46,6 +46,17 @@ SHARKIQ_REGION_OPTIONS = [SHARKIQ_REGION_EUROPE, SHARKIQ_REGION_ELSEWHERE]
 BACKEND_AYLA = "ayla"
 BACKEND_SKEGOX = "skegox"
 CONF_BACKEND = "backend"
+
+# Options flow: cleaning presets. Each preset bundles a name, the target
+# vacuum's serial number, the rooms to clean, the clean mode, and the fan
+# speed. Each preset materializes as one button entity per device card.
+CONF_PRESETS = "presets"
+PRESET_ID = "id"
+PRESET_NAME = "name"
+PRESET_SERIAL = "serial"
+PRESET_ROOMS = "rooms"
+PRESET_CLEAN_TYPE = "clean_type"
+PRESET_FAN_SPEED = "fan_speed"
 
 # Auth0 settings
 AUTH0_CLIENT_ID_US = "wsguxrqm77mq4LtrTrwg8ZJUxmSrexGi"

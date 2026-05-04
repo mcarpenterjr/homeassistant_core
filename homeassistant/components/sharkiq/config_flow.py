@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Mapping
+import secrets
 import socket
 from typing import Any
 
@@ -11,17 +12,31 @@ import aiohttp
 from sharkiq import SharkIqAuthError, get_ayla_api
 import voluptuous as vol
 
-from homeassistant.config_entries import ConfigFlow, ConfigFlowResult
+from homeassistant.config_entries import (
+    ConfigEntry,
+    ConfigFlow,
+    ConfigFlowResult,
+    OptionsFlowWithReload,
+)
 from homeassistant.const import CONF_PASSWORD, CONF_REGION, CONF_USERNAME
-from homeassistant.core import HomeAssistant
+from homeassistant.core import HomeAssistant, callback
 from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers import selector
 from homeassistant.helpers.aiohttp_client import async_create_clientsession
 
 from .auth import SharkAuth, SharkAuthError
 from .const import (
+    CLEAN_TYPES,
+    CONF_PRESETS,
     DOMAIN,
+    FAN_SPEED_NAMES,
     LOGGER,
+    PRESET_CLEAN_TYPE,
+    PRESET_FAN_SPEED,
+    PRESET_ID,
+    PRESET_NAME,
+    PRESET_ROOMS,
+    PRESET_SERIAL,
     SHARKIQ_REGION_DEFAULT,
     SHARKIQ_REGION_EUROPE,
     SHARKIQ_REGION_OPTIONS,
@@ -111,6 +126,14 @@ class SharkIqConfigFlow(ConfigFlow, domain=DOMAIN):
 
     VERSION = 1
 
+    @staticmethod
+    @callback
+    def async_get_options_flow(
+        config_entry: ConfigEntry,
+    ) -> SharkIqOptionsFlow:
+        """Return the options flow for managing cleaning presets."""
+        return SharkIqOptionsFlow()
+
     async def _async_validate_input(
         self, user_input: Mapping[str, Any]
     ) -> tuple[dict[str, str] | None, dict[str, str]]:
@@ -186,3 +209,232 @@ class InvalidAuth(HomeAssistantError):
 
 class UnknownAuth(HomeAssistantError):
     """Error to indicate there is an uncaught auth error."""
+
+
+class SharkIqOptionsFlow(OptionsFlowWithReload):
+    """Manage cleaning presets for the SharkIQ integration.
+
+    Each preset bundles a name, the target vacuum's serial number, the
+    rooms to clean, the clean mode, and the fan speed. Presets are stored
+    as a list under ``config_entry.options[CONF_PRESETS]``; one button
+    entity is created per preset on entry setup.
+    """
+
+    def __init__(self) -> None:
+        """Set up scratch state for in-progress edits."""
+        self._target_serial: str | None = None
+        self._editing_id: str | None = None
+
+    @property
+    def _presets(self) -> list[dict[str, Any]]:
+        """Return the current preset list (a copy)."""
+        return list(self.config_entry.options.get(CONF_PRESETS, []))
+
+    def _device_choices(self) -> dict[str, str]:
+        """Return ``{serial_number: display_name}`` for known vacuums."""
+        coordinator = self.config_entry.runtime_data
+        return {vac.serial_number: vac.name for vac in coordinator.shark_vacs.values()}
+
+    def _device_rooms(self, serial: str) -> list[str]:
+        """Return the named rooms reported by the given vacuum, or ``[]``."""
+        coordinator = self.config_entry.runtime_data
+        device = coordinator.shark_vacs.get(serial)
+        if device is None:
+            return []
+        try:
+            room_list = device.get_property_value("Robot_Room_List")
+        except KeyError:
+            return []
+        if not room_list or ":" not in room_list:
+            return []
+        return room_list.split(":")[1:]
+
+    async def async_step_init(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        """Top-level menu: add a preset, edit / remove an existing one."""
+        menu_options: list[str] = ["add_preset"]
+        if self._presets:
+            menu_options.extend(["edit_preset", "remove_preset"])
+        return self.async_show_menu(step_id="init", menu_options=menu_options)
+
+    async def async_step_add_preset(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        """Pick the target vacuum (auto-skipped on single-vacuum accounts)."""
+        choices = self._device_choices()
+        if not choices:
+            return self.async_abort(reason="no_devices")
+
+        if len(choices) == 1:
+            self._target_serial = next(iter(choices))
+            self._editing_id = None
+            return await self.async_step_preset_form()
+
+        if user_input is not None:
+            self._target_serial = user_input[PRESET_SERIAL]
+            self._editing_id = None
+            return await self.async_step_preset_form()
+
+        return self.async_show_form(
+            step_id="add_preset",
+            data_schema=vol.Schema(
+                {
+                    vol.Required(PRESET_SERIAL): selector.SelectSelector(
+                        selector.SelectSelectorConfig(
+                            options=[
+                                selector.SelectOptionDict(value=serial, label=name)
+                                for serial, name in choices.items()
+                            ],
+                        )
+                    ),
+                }
+            ),
+        )
+
+    async def async_step_preset_form(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        """Collect preset name / rooms / clean type / fan speed."""
+        assert self._target_serial is not None
+        rooms = self._device_rooms(self._target_serial)
+        existing = next(
+            (p for p in self._presets if p.get(PRESET_ID) == self._editing_id),
+            None,
+        )
+
+        if user_input is not None:
+            new_preset: dict[str, Any] = {
+                PRESET_ID: existing.get(PRESET_ID) if existing else secrets.token_hex(4),
+                PRESET_SERIAL: self._target_serial,
+                PRESET_NAME: user_input[PRESET_NAME],
+                PRESET_ROOMS: user_input[PRESET_ROOMS],
+                PRESET_CLEAN_TYPE: user_input[PRESET_CLEAN_TYPE],
+                PRESET_FAN_SPEED: user_input[PRESET_FAN_SPEED],
+            }
+            updated = [p for p in self._presets if p.get(PRESET_ID) != new_preset[PRESET_ID]]
+            updated.append(new_preset)
+            return self.async_create_entry(
+                title="",
+                data={**self.config_entry.options, CONF_PRESETS: updated},
+            )
+
+        defaults_name = existing.get(PRESET_NAME, "") if existing else ""
+        defaults_rooms = existing.get(PRESET_ROOMS, []) if existing else []
+        defaults_clean = existing.get(PRESET_CLEAN_TYPE, "dry") if existing else "dry"
+        defaults_fan = existing.get(PRESET_FAN_SPEED, "Normal") if existing else "Normal"
+
+        # Use a multi-select with custom_value so the user can type a room
+        # name that isn't in the discovered list (e.g. when the device hasn't
+        # yet reported its room map, or when a room name has been renamed in
+        # the SharkClean app between polls).
+        schema = vol.Schema(
+            {
+                vol.Required(PRESET_NAME, default=defaults_name): str,
+                vol.Required(
+                    PRESET_ROOMS, default=defaults_rooms
+                ): selector.SelectSelector(
+                    selector.SelectSelectorConfig(
+                        options=rooms,
+                        multiple=True,
+                        custom_value=True,
+                    )
+                ),
+                vol.Required(
+                    PRESET_CLEAN_TYPE, default=defaults_clean
+                ): selector.SelectSelector(
+                    selector.SelectSelectorConfig(
+                        options=list(CLEAN_TYPES),
+                        translation_key="clean_type",
+                    )
+                ),
+                vol.Required(
+                    PRESET_FAN_SPEED, default=defaults_fan
+                ): selector.SelectSelector(
+                    selector.SelectSelectorConfig(options=list(FAN_SPEED_NAMES))
+                ),
+            }
+        )
+
+        return self.async_show_form(step_id="preset_form", data_schema=schema)
+
+    async def async_step_edit_preset(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        """Pick which existing preset to edit, then route to the form."""
+        presets = self._presets
+        if not presets:
+            return await self.async_step_init()
+
+        if user_input is not None:
+            chosen = next(
+                (p for p in presets if p.get(PRESET_ID) == user_input[PRESET_ID]),
+                None,
+            )
+            if chosen is None:
+                return await self.async_step_init()
+            self._target_serial = chosen[PRESET_SERIAL]
+            self._editing_id = chosen[PRESET_ID]
+            return await self.async_step_preset_form()
+
+        choices = self._device_choices()
+        return self.async_show_form(
+            step_id="edit_preset",
+            data_schema=vol.Schema(
+                {
+                    vol.Required(PRESET_ID): selector.SelectSelector(
+                        selector.SelectSelectorConfig(
+                            options=[
+                                selector.SelectOptionDict(
+                                    value=p[PRESET_ID],
+                                    label=(
+                                        f"{p[PRESET_NAME]}"
+                                        f" ({choices.get(p[PRESET_SERIAL], p[PRESET_SERIAL])})"
+                                    ),
+                                )
+                                for p in presets
+                            ],
+                        )
+                    ),
+                }
+            ),
+        )
+
+    async def async_step_remove_preset(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        """Pick which preset(s) to delete."""
+        presets = self._presets
+        if not presets:
+            return await self.async_step_init()
+
+        if user_input is not None:
+            kept = [p for p in presets if p[PRESET_ID] not in user_input[PRESET_ID]]
+            return self.async_create_entry(
+                title="",
+                data={**self.config_entry.options, CONF_PRESETS: kept},
+            )
+
+        choices = self._device_choices()
+        return self.async_show_form(
+            step_id="remove_preset",
+            data_schema=vol.Schema(
+                {
+                    vol.Required(PRESET_ID): selector.SelectSelector(
+                        selector.SelectSelectorConfig(
+                            multiple=True,
+                            options=[
+                                selector.SelectOptionDict(
+                                    value=p[PRESET_ID],
+                                    label=(
+                                        f"{p[PRESET_NAME]}"
+                                        f" ({choices.get(p[PRESET_SERIAL], p[PRESET_SERIAL])})"
+                                    ),
+                                )
+                                for p in presets
+                            ],
+                        )
+                    ),
+                }
+            ),
+        )

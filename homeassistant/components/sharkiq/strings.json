@@ -33,15 +33,59 @@
       }
     }
   },
+  "options": {
+    "abort": {
+      "no_devices": "No vacuums are currently loaded for this account. Reload the integration and try again."
+    },
+    "step": {
+      "init": {
+        "title": "Cleaning presets",
+        "description": "A preset bundles a set of rooms, a clean mode, and a fan speed into a one-tap button on the vacuum's device card.",
+        "menu_options": {
+          "add_preset": "Add a preset",
+          "edit_preset": "Edit a preset",
+          "remove_preset": "Remove preset(s)"
+        }
+      },
+      "add_preset": {
+        "title": "Pick a vacuum",
+        "description": "Which vacuum should this preset target?",
+        "data": {
+          "serial": "Vacuum"
+        }
+      },
+      "preset_form": {
+        "title": "Preset details",
+        "description": "Name, rooms, clean mode, and fan speed for this preset. The button entity name follows the preset name.",
+        "data": {
+          "name": "Name",
+          "rooms": "Rooms",
+          "clean_type": "Clean mode",
+          "fan_speed": "Fan speed"
+        }
+      },
+      "edit_preset": {
+        "title": "Edit a preset",
+        "description": "Pick the preset to edit.",
+        "data": {
+          "id": "Preset"
+        }
+      },
+      "remove_preset": {
+        "title": "Remove preset(s)",
+        "description": "Pick one or more presets to delete. The corresponding button entities will disappear after the integration reloads.",
+        "data": {
+          "id": "Presets"
+        }
+      }
+    }
+  },
   "exceptions": {
     "invalid_room": {
       "message": "The room {room} is unavailable to your vacuum. Make sure all rooms match the SharkClean app, including capitalization."
     },
     "invalid_fan_speed": {
       "message": "Fan speed {fan_speed} is not supported. Use one of: Eco, Normal, Max."
-    },
-    "empty_room_queue": {
-      "message": "No rooms are queued for cleaning. Toggle one or more 'Queue …' switches first."
     }
   },
   "selector": {
@@ -49,6 +93,14 @@
       "options": {
         "elsewhere": "Everywhere else",
         "europe": "Europe"
+      }
+    },
+    "clean_type": {
+      "options": {
+        "dry": "Dry vacuum",
+        "wet": "Wet mop",
+        "matrix": "Matrix",
+        "spot": "Spot"
       }
     }
   },
@@ -70,29 +122,6 @@
         }
       },
       "name": "Clean room"
-    }
-  },
-  "entity": {
-    "button": {
-      "start_room_clean": {
-        "name": "Start room clean"
-      }
-    },
-    "select": {
-      "clean_type": {
-        "name": "Clean mode",
-        "state": {
-          "dry": "Dry vacuum",
-          "wet": "Wet mop",
-          "matrix": "Matrix",
-          "spot": "Spot"
-        }
-      }
-    },
-    "switch": {
-      "queue_room": {
-        "name": "Queue {room}"
-      }
     }
   }
 }

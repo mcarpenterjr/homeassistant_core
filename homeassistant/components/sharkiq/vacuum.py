@@ -264,11 +264,22 @@ class SharkVacuumEntity(CoordinatorEntity[SharkIqUpdateCoordinator], StateVacuum
         return fan_speed
 
     async def async_set_fan_speed(self, fan_speed: str, **kwargs: Any) -> None:
-        """Set the fan speed."""
+        """Set the fan speed.
+
+        Skegox shadows are eventually-consistent: a synchronous refresh
+        right after the PATCH would re-read the still-old reported value
+        and snap the UI back to it (the visible bug a user reported as
+        "only Normal is selectable"). The wrapper updates its local state
+        optimistically inside ``async_set_property_value``, so push that
+        to HA directly and let the next regular poll reconcile.
+        """
+        normalized = fan_speed.capitalize()
+        if normalized not in FAN_SPEEDS_MAP:
+            return
         await self.sharkiq.async_set_property_value(
-            Properties.POWER_MODE, FAN_SPEEDS_MAP.get(fan_speed.capitalize())
+            Properties.POWER_MODE, FAN_SPEEDS_MAP[normalized]
         )
-        await self.coordinator.async_refresh()
+        self.async_write_ha_state()
 
     # Various attributes we want to expose
     @property

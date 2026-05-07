@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import base64
+import hashlib
 import json
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
+from urllib.parse import parse_qs, urlparse
 
 import aiohttp
 import pytest
@@ -15,6 +18,9 @@ from homeassistant.components.sharkiq.auth import (
     SharkAuthInvalidCredentialsError,
     SharkAuthRateLimitedError,
     SharkAuthVerificationRequiredError,
+    build_authorize_url,
+    generate_pkce_pair,
+    parse_callback_input,
     raise_if_auth0_account_blocked,
 )
 
@@ -35,6 +41,137 @@ def _build_session(status: int, body: str) -> MagicMock:
     return session
 
 
+def _new_auth(websession: aiohttp.ClientSession, *, europe: bool = False) -> SharkAuth:
+    """Construct a fresh SharkAuth with no stored tokens."""
+    return SharkAuth(websession=websession, europe=europe)
+
+
+# ---------------------------------------------------------------------------
+# PKCE helpers
+# ---------------------------------------------------------------------------
+
+
+def test_generate_pkce_pair_meets_rfc7636() -> None:
+    """Verifier is 43-128 URL-safe chars, challenge is its sha256 base64url.
+
+    Auth0 strictly validates the challenge derivation — even a one-byte
+    encoding bug means every authorization_code exchange fails with
+    invalid_grant. Lock this in.
+    """
+    verifier, challenge = generate_pkce_pair()
+
+    assert 43 <= len(verifier) <= 128
+    # URL-safe alphabet only — RFC 7636 §4.1 requires no = padding either.
+    assert all(c.isalnum() or c in "-._~" for c in verifier)
+
+    # Challenge is base64url(sha256(verifier)) with padding stripped.
+    expected = (
+        base64.urlsafe_b64encode(hashlib.sha256(verifier.encode()).digest())
+        .rstrip(b"=")
+        .decode()
+    )
+    assert challenge == expected
+
+
+def test_generate_pkce_pair_returns_unique_values() -> None:
+    """Each call must produce a fresh pair — reused PKCE state defeats the protection."""
+    pairs = {generate_pkce_pair() for _ in range(20)}
+    assert len(pairs) == 20
+
+
+# ---------------------------------------------------------------------------
+# Authorize URL construction
+# ---------------------------------------------------------------------------
+
+
+def test_build_authorize_url_us_includes_required_params() -> None:
+    """The /authorize URL must carry every PKCE-required parameter Auth0 demands."""
+    url = build_authorize_url(
+        europe=False, code_challenge="abc-challenge", state="xyz-state"
+    )
+    parsed = urlparse(url)
+    params = parse_qs(parsed.query)
+
+    assert parsed.netloc == "login.sharkninja.com"
+    assert parsed.path == "/authorize"
+    assert params["response_type"] == ["code"]
+    assert params["code_challenge_method"] == ["S256"]
+    assert params["code_challenge"] == ["abc-challenge"]
+    assert params["state"] == ["xyz-state"]
+    # Custom iOS scheme — desktop browsers can't launch it but still surface
+    # the URL with the code, which is the whole point of the paste flow.
+    assert params["redirect_uri"][0].startswith("com.sharkninja.shark://")
+    assert "openid" in params["scope"][0]
+    assert "offline_access" in params["scope"][0]
+    # ``prompt=login`` forces a fresh login even with an existing session;
+    # important for reauth where the stored tokens have already gone bad.
+    assert params["prompt"] == ["login"]
+
+
+def test_build_authorize_url_eu_uses_eu_host() -> None:
+    """EU accounts must hit logineu.sharkninja.com or auth fails opaquely."""
+    url = build_authorize_url(
+        europe=True, code_challenge="x", state="y"
+    )
+    assert urlparse(url).netloc == "logineu.sharkninja.com"
+
+
+# ---------------------------------------------------------------------------
+# Callback parsing
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("text", "expected_code", "expected_state"),
+    [
+        # Full redirect URL the browser ends up on after Auth0's redirect.
+        (
+            "com.sharkninja.shark://login.sharkninja.com/ios/com.sharkninja.shark/callback?code=AUTH_CODE_123&state=STATE_456",
+            "AUTH_CODE_123",
+            "STATE_456",
+        ),
+        # User pasted just the query string (some browsers truncate the scheme).
+        ("?code=AUTH_CODE_123&state=STATE_456", "AUTH_CODE_123", "STATE_456"),
+        # Bare code without state — accepted but state validation skipped.
+        ("AUTH_CODE_123", "AUTH_CODE_123", None),
+        # Whitespace tolerance — users copy-paste from terminals or chat apps.
+        ("   AUTH_CODE_123   ", "AUTH_CODE_123", None),
+        # URL with code but no state (some Auth0 configs).
+        (
+            "com.sharkninja.shark://callback?code=ONLY_CODE",
+            "ONLY_CODE",
+            None,
+        ),
+    ],
+)
+def test_parse_callback_input_accepts_known_shapes(
+    text: str, expected_code: str, expected_state: str | None
+) -> None:
+    """Every shape a real user might paste should produce a usable code."""
+    code, state = parse_callback_input(text)
+    assert code == expected_code
+    assert state == expected_state
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "",
+        "   ",
+        "https://example.com/callback?error=access_denied",  # has ``=`` but no ``code=``
+    ],
+)
+def test_parse_callback_input_rejects_codeless_input(text: str) -> None:
+    """Inputs with no extractable code must raise so the form can re-prompt."""
+    with pytest.raises(ValueError):
+        parse_callback_input(text)
+
+
+# ---------------------------------------------------------------------------
+# Token exchange — error classification
+# ---------------------------------------------------------------------------
+
+
 @pytest.mark.parametrize(
     ("status", "body", "expected_exc"),
     [
@@ -47,23 +184,22 @@ def _build_session(status: int, body: str) -> MagicMock:
             SharkAuthVerificationRequiredError,
         ),
         # Same anti-fraud category, different signal: account got hit by too
-        # many failed login attempts. We want backoff, not reauth.
+        # many failed login attempts.
         (
             429,
             '{"error":"too_many_attempts","error_description":"blocked"}',
             SharkAuthRateLimitedError,
         ),
-        # Auth0 emits ``too_many_attempts`` with status 401 in some tenants too.
         (
             401,
             '{"error":"too_many_attempts","error_description":"blocked"}',
             SharkAuthRateLimitedError,
         ),
-        # Wrong username/password. Distinct from anti-fraud because the user
-        # actually needs to fix their credentials, not their network.
+        # ``invalid_grant`` is the canonical PKCE-flow error for an expired
+        # or replayed authorization code.
         (
             401,
-            '{"error":"invalid_grant","error_description":"Wrong email or password"}',
+            '{"error":"invalid_grant","error_description":"Code expired"}',
             SharkAuthInvalidCredentialsError,
         ),
         # 403 without a recognised ``error`` field — bot-detection on the
@@ -72,175 +208,202 @@ def _build_session(status: int, body: str) -> MagicMock:
         # Status outside known ranges + non-JSON body still produces a clean
         # error rather than a ValueError on json.loads.
         (500, "<html>oops</html>", SharkAuthError),
-        # Empty body — must not raise the JSON decode error to the caller.
+        # Empty body — must not raise a JSON decode error to the caller.
         (502, "", SharkAuthError),
     ],
 )
-async def test_async_sign_in_classifies_auth0_errors(
+async def test_async_exchange_code_classifies_auth0_errors(
     status: int, body: str, expected_exc: type[SharkAuthError]
 ) -> None:
     """Each Auth0 failure mode maps to its specific exception subclass."""
     session = _build_session(status, body)
-    auth = SharkAuth(
-        username="u@example.com",
-        password="pw",
-        websession=session,
-        europe=False,
-    )
+    auth = _new_auth(session)
 
     with pytest.raises(expected_exc):
-        await auth.async_sign_in()
+        await auth.async_exchange_code("dummy_code", "dummy_verifier")
 
 
-async def test_async_sign_in_success_populates_tokens() -> None:
+async def test_async_exchange_code_success_populates_tokens() -> None:
     """Happy path stores id_token, refresh_token, and expiry."""
     body = json.dumps(
         {
             "id_token": "eyJhbGciOi.eyJzdWIiOiJhdXRoMHwxMjMifQ.sig",
             "access_token": "access",
-            "refresh_token": "refresh",
+            "refresh_token": "refresh-stored",
+            "expires_in": 86400,
+        }
+    )
+    session = _build_session(200, body)
+    auth = _new_auth(session)
+
+    await auth.async_exchange_code("code", "verifier")
+
+    assert auth.id_token == "eyJhbGciOi.eyJzdWIiOiJhdXRoMHwxMjMifQ.sig"
+    assert auth.refresh_token == "refresh-stored"
+    assert auth.is_authenticated is True
+    # JWT sub claim is "auth0|123" — user_id strips the "auth0|" prefix.
+    assert auth.user_id == "123"
+
+
+async def test_async_exchange_code_sends_pkce_payload() -> None:
+    """Token request must include code, code_verifier, and the correct grant type."""
+    body = json.dumps({"id_token": "x.y.z", "expires_in": 60})
+    session = _build_session(200, body)
+    auth = _new_auth(session)
+
+    await auth.async_exchange_code("AUTH_CODE", "MY_VERIFIER")
+
+    _args, kwargs = session.post.call_args
+    payload = kwargs["json"]
+    assert payload["grant_type"] == "authorization_code"
+    assert payload["code"] == "AUTH_CODE"
+    assert payload["code_verifier"] == "MY_VERIFIER"
+    assert payload["redirect_uri"].startswith("com.sharkninja.shark://")
+
+
+# ---------------------------------------------------------------------------
+# Refresh + headers + email
+# ---------------------------------------------------------------------------
+
+
+async def test_async_refresh_auth_uses_stored_refresh_token() -> None:
+    """Refresh flow posts grant_type=refresh_token with the stored token."""
+    body = json.dumps(
+        {
+            "id_token": "eyJhbGciOi.eyJzdWIiOiJhdXRoMHwxMjMifQ.sig",
+            "refresh_token": "rotated-refresh",
             "expires_in": 86400,
         }
     )
     session = _build_session(200, body)
     auth = SharkAuth(
-        username="u@example.com",
-        password="pw",
         websession=session,
         europe=False,
+        refresh_token="seed-refresh",
+        id_token=None,
+        token_expiry=0,
     )
 
-    await auth.async_sign_in()
+    await auth.async_refresh_auth()
 
-    assert auth.id_token == "eyJhbGciOi.eyJzdWIiOiJhdXRoMHwxMjMifQ.sig"
-    assert auth.is_authenticated is True
-    # JWT sub claim is "auth0|123" — user_id should strip the "auth0|" prefix.
-    assert auth.user_id == "123"
+    _args, kwargs = session.post.call_args
+    payload = kwargs["json"]
+    assert payload["grant_type"] == "refresh_token"
+    assert payload["refresh_token"] == "seed-refresh"
+    # Refresh tokens rotate — the new one must replace the seed.
+    assert auth.refresh_token == "rotated-refresh"
 
 
-async def test_async_sign_in_sends_sharkclean_app_fingerprint() -> None:
+async def test_async_refresh_auth_without_token_raises() -> None:
+    """No refresh token means we have nothing to refresh; surface clearly."""
+    session = _build_session(200, "{}")
+    auth = _new_auth(session)
+    with pytest.raises(SharkAuthError):
+        await auth.async_refresh_auth()
+
+
+async def test_token_request_sends_sharkclean_app_fingerprint() -> None:
     """Token requests carry SharkClean-app-style headers, not naked JSON.
 
     Auth0's anti-fraud is trained against the real Android app's request
     fingerprint. A POST that's missing User-Agent / Origin / Referer scores
     high enough to trip a ``requires_verification`` challenge even on an
-    otherwise-clean account, so we explicitly mimic the app's headers. If
-    this test starts failing it means the fingerprint regressed — Auth0
-    will likely re-flag the account in production until it's restored.
+    otherwise-clean account.
     """
-    body = json.dumps(
-        {
-            "id_token": "eyJhbGciOi.eyJzdWIiOiJ4In0.sig",
-            "refresh_token": "r",
-            "expires_in": 86400,
-        }
-    )
+    body = json.dumps({"id_token": "a.b.c", "refresh_token": "r", "expires_in": 60})
     session = _build_session(200, body)
-    auth = SharkAuth(
-        username="u@example.com",
-        password="pw",
-        websession=session,
-        europe=False,
-    )
+    auth = _new_auth(session)
 
-    await auth.async_sign_in()
+    await auth.async_exchange_code("c", "v")
 
-    # Inspect what was actually sent to the post call.
     _args, kwargs = session.post.call_args
     headers = kwargs["headers"]
     assert headers["Content-Type"] == "application/json"
     assert "User-Agent" in headers
-    # Specifically: a mobile-app-shaped UA, not the python aiohttp default.
     assert "Mobile" in headers["User-Agent"] or "Android" in headers["User-Agent"]
-    # Origin/Referer must point at the Auth0 host the token URL targets, not
-    # be hard-coded — different regions use different hosts.
     assert headers["Origin"] == "https://login.sharkninja.com"
     assert headers["Referer"] == "https://login.sharkninja.com/"
 
 
-async def test_async_sign_in_origin_follows_eu_token_url() -> None:
+async def test_token_request_origin_follows_eu_host() -> None:
     """EU accounts hit ``logineu.sharkninja.com``; Origin/Referer must match."""
-    body = json.dumps(
-        {
-            "id_token": "eyJhbGciOi.eyJzdWIiOiJ4In0.sig",
-            "expires_in": 86400,
-        }
-    )
+    body = json.dumps({"id_token": "a.b.c", "expires_in": 60})
     session = _build_session(200, body)
-    auth = SharkAuth(
-        username="u@example.com",
-        password="pw",
-        websession=session,
-        europe=True,
-    )
+    auth = _new_auth(session, europe=True)
 
-    await auth.async_sign_in()
+    await auth.async_exchange_code("c", "v")
 
     _args, kwargs = session.post.call_args
-    headers = kwargs["headers"]
-    assert headers["Origin"] == "https://logineu.sharkninja.com"
+    assert kwargs["headers"]["Origin"] == "https://logineu.sharkninja.com"
 
 
-async def test_async_sign_in_network_error_wrapped() -> None:
+def test_email_property_extracts_jwt_email_claim() -> None:
+    """Email comes from the id_token's ``email`` claim, not the sub claim."""
+    # JWT payload: {"sub": "auth0|123", "email": "person@example.com"}
+    payload_b64 = (
+        base64.urlsafe_b64encode(
+            json.dumps({"sub": "auth0|123", "email": "person@example.com"}).encode()
+        )
+        .rstrip(b"=")
+        .decode()
+    )
+    auth = SharkAuth(
+        websession=MagicMock(spec=aiohttp.ClientSession),
+        id_token=f"header.{payload_b64}.signature",
+    )
+    assert auth.email == "person@example.com"
+    assert auth.user_id == "123"
+
+
+def test_email_property_returns_none_without_claim() -> None:
+    """Some Auth0 tenants omit the email claim — must not crash on it."""
+    payload_b64 = (
+        base64.urlsafe_b64encode(json.dumps({"sub": "auth0|123"}).encode())
+        .rstrip(b"=")
+        .decode()
+    )
+    auth = SharkAuth(
+        websession=MagicMock(spec=aiohttp.ClientSession),
+        id_token=f"header.{payload_b64}.signature",
+    )
+    assert auth.email is None
+
+
+async def test_async_refresh_with_network_error_wrapped() -> None:
     """Transport-layer errors are wrapped as SharkAuthError, not bubbled raw."""
     session = MagicMock(spec=aiohttp.ClientSession)
     session.post = MagicMock(
         side_effect=aiohttp.ClientConnectorError(MagicMock(), OSError("boom"))
     )
     auth = SharkAuth(
-        username="u@example.com",
-        password="pw",
         websession=session,
-        europe=False,
+        refresh_token="r",
     )
 
     with pytest.raises(SharkAuthError) as exc_info:
-        await auth.async_sign_in()
+        await auth.async_refresh_auth()
     # Specific subclasses are reserved for Auth0-tagged failures, so a generic
-    # network error must surface as the base class — callers use that to decide
-    # whether to retry a different backend.
+    # network error must surface as the base class — callers use that to
+    # decide whether to retry vs. trigger reauth.
     assert type(exc_info.value) is SharkAuthError
 
 
-async def test_refresh_falls_back_to_full_signin_on_failure() -> None:
-    """If the refresh-token request fails, retry with password grant."""
-    auth = SharkAuth(
-        username="u@example.com",
-        password="pw",
-        websession=MagicMock(spec=aiohttp.ClientSession),
-        europe=False,
-    )
-    # Pretend we have a refresh token from a previous sign-in.
-    auth._refresh_token = "stale-refresh-token"  # noqa: SLF001
-
-    # First call (refresh attempt) blows up; second call (sign_in fallback)
-    # succeeds. We assert sign_in is invoked exactly once after the failure.
-    with patch.object(
-        auth,
-        "_async_token_request",
-        side_effect=[SharkAuthError("refresh denied"), None],
-    ) as token_request:
-        await auth.async_refresh_auth()
-
-    assert token_request.call_count == 2
-    # Second call should be a password grant, not another refresh.
-    second_payload: dict[str, Any] = token_request.call_args_list[1].args[0]
-    assert second_payload["grant_type"].endswith("password-realm")
+# ---------------------------------------------------------------------------
+# Account-blocked classifier (used by callers that catch errors from
+# legacy code paths and need to decide whether to bubble to reauth.)
+# ---------------------------------------------------------------------------
 
 
 @pytest.mark.parametrize(
     ("message", "expected_exc"),
     [
-        # Skegox path uses underscore form (response JSON ``error`` field).
-        ("Auth0 returned 401: {\"error\":\"requires_verification\"}", SharkAuthVerificationRequiredError),
-        # Pip lib's auth0.exceptions.Auth0Error message uses the human form.
+        (
+            'Auth0 returned 401: {"error":"requires_verification"}',
+            SharkAuthVerificationRequiredError,
+        ),
         ("401: Suspicious request requires verification", SharkAuthVerificationRequiredError),
-        # The phrase "requires verification" alone is enough — different libs
-        # reformat the same Auth0 response in different ways.
         ("Authentication failed: requires verification", SharkAuthVerificationRequiredError),
-        # 429 path — rate limiter.
         ('{"error":"too_many_attempts"}', SharkAuthRateLimitedError),
-        # Pip lib surfaces 429 with this exact phrase from the Ayla response.
         (
             "429: Your account has been blocked after multiple consecutive login attempts.",
             SharkAuthRateLimitedError,
@@ -258,20 +421,12 @@ def test_raise_if_auth0_account_blocked_classifies_messages(
 @pytest.mark.parametrize(
     "message",
     [
-        # Generic auth failure that is NOT Auth0 anti-fraud — caller should
-        # be free to fall through to the other backend.
         "Username or password incorrect",
-        # Network problem — definitely not an account-level signal.
         "Network is unreachable",
-        # Empty / no message at all.
         "",
-        # Word-similarity false positive guard: "verification" only triggers
-        # when paired with the Auth0-specific phrasing, not in arbitrary text.
         "Email verification not required for this user",
     ],
 )
 def test_raise_if_auth0_account_blocked_passes_unrelated_errors(message: str) -> None:
     """No-op when the message doesn't match a known Auth0 account-level pattern."""
-    # Should return cleanly; the caller is then responsible for whatever
-    # generic handling applies (fall through, retry, or surface as invalid_auth).
     raise_if_auth0_account_blocked(Exception(message))

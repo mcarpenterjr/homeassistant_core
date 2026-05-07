@@ -1,15 +1,39 @@
-"""Auth0 authentication for SharkNinja API."""
+"""Auth0 authentication for SharkNinja API.
+
+The integration uses PKCE / authorization-code-with-paste rather than the
+password-realm grant. The user opens an ``/authorize`` URL in their own
+browser, completes login (and any Auth0 anti-fraud verification) there,
+then pastes the resulting redirect URL back into the config flow. This is
+the only flow that reliably gets past Auth0's ``requires_verification``
+challenge, because the challenge is meant to be answered interactively —
+which a server cannot do but a browser can. Once we have the initial
+refresh token, ``grant_type=refresh_token`` works server-side without
+re-triggering verification.
+"""
 
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
 import secrets
 import time
 from typing import Any, NoReturn
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlencode, urlparse
 
 import aiohttp
+
+from .const import (
+    AUTH0_AUTHORIZE_URL_EU,
+    AUTH0_AUTHORIZE_URL_US,
+    AUTH0_CLIENT_ID_EU,
+    AUTH0_CLIENT_ID_US,
+    AUTH0_SCOPES,
+    AUTH0_TOKEN_URL_EU,
+    AUTH0_TOKEN_URL_US,
+    LOGGER,
+    SHARKCLEAN_REDIRECT_URI,
+)
 
 # Mimic the SharkClean Android app's request fingerprint. Auth0's anti-fraud
 # trains on real app traffic — a naked POST with no User-Agent from a server
@@ -19,14 +43,6 @@ import aiohttp
 _SHARKCLEAN_USER_AGENT = (
     "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/139.0.0.0 Mobile Safari/537.36"
-)
-
-from .const import (
-    AUTH0_CLIENT_ID_EU,
-    AUTH0_CLIENT_ID_US,
-    AUTH0_TOKEN_URL_EU,
-    AUTH0_TOKEN_URL_US,
-    LOGGER,
 )
 
 
@@ -55,6 +71,74 @@ class SharkAuthInvalidCredentialsError(SharkAuthError):
     """Username or password is incorrect."""
 
 
+def generate_pkce_pair() -> tuple[str, str]:
+    """Return a fresh ``(code_verifier, code_challenge)`` pair for PKCE.
+
+    RFC 7636 specifies code_verifier as 43-128 chars from the URL-safe
+    alphabet, and code_challenge as the base64url-encoded SHA-256 of the
+    verifier with padding stripped.
+    """
+    verifier = secrets.token_urlsafe(64)[:96]
+    challenge = (
+        base64.urlsafe_b64encode(hashlib.sha256(verifier.encode()).digest())
+        .rstrip(b"=")
+        .decode()
+    )
+    return verifier, challenge
+
+
+def build_authorize_url(
+    *, europe: bool, code_challenge: str, state: str
+) -> str:
+    """Build the URL the user opens in their browser to start login."""
+    base = AUTH0_AUTHORIZE_URL_EU if europe else AUTH0_AUTHORIZE_URL_US
+    client_id = AUTH0_CLIENT_ID_EU if europe else AUTH0_CLIENT_ID_US
+    params = {
+        "response_type": "code",
+        "code_challenge_method": "S256",
+        "code_challenge": code_challenge,
+        "client_id": client_id,
+        "redirect_uri": SHARKCLEAN_REDIRECT_URI,
+        "scope": AUTH0_SCOPES,
+        "state": state,
+        # ``prompt=login`` forces Auth0 to re-prompt even if the user has
+        # an existing session — important for reauth flows where the
+        # stored tokens have already failed.
+        "prompt": "login",
+    }
+    return f"{base}?{urlencode(params)}"
+
+
+def parse_callback_input(text: str) -> tuple[str, str | None]:
+    """Extract ``(code, state)`` from a pasted redirect URL or bare code.
+
+    Browsers can't launch the ``com.sharkninja.shark://`` scheme, so the
+    user copies the URL bar value (which still contains the query string)
+    or just the ``code`` parameter from it. We accept either shape.
+
+    Raises ValueError if no code can be extracted.
+    """
+    text = text.strip()
+    if not text:
+        raise ValueError("empty input")
+
+    # Heuristic: anything starting with a scheme is a URL; otherwise treat
+    # as a bare code. We look for ``code=`` in the middle as well to handle
+    # users who paste just the query string.
+    if "code=" in text:
+        # Even if the URL is malformed (e.g. "?code=abc&state=xyz"), pulling
+        # the query string out keeps us robust to weird browser behavior.
+        query_start = text.find("?")
+        query = text[query_start + 1 :] if query_start >= 0 else text
+        params = parse_qs(query)
+        codes = params.get("code", [])
+        states = params.get("state", [])
+        if not codes:
+            raise ValueError("no code in URL")
+        return codes[0], states[0] if states else None
+    return text, None
+
+
 def raise_if_auth0_account_blocked(err: BaseException) -> None:
     """Re-raise as a specific Auth0 account-level error if the message matches.
 
@@ -81,15 +165,20 @@ class SharkAuth:
 
     def __init__(
         self,
-        username: str,
-        password: str,
         websession: aiohttp.ClientSession,
         *,
         europe: bool = False,
+        refresh_token: str | None = None,
+        id_token: str | None = None,
+        token_expiry: float = 0,
     ) -> None:
-        """Initialize the auth handler."""
-        self._username = username
-        self._password = password
+        """Initialize the auth handler.
+
+        Construct without tokens for a fresh PKCE flow (call
+        :meth:`async_exchange_code` after the user pastes the redirect),
+        or pass ``refresh_token``/``id_token``/``token_expiry`` to
+        restore from previously-persisted state.
+        """
         self._websession = websession
         self._europe = europe
 
@@ -100,10 +189,10 @@ class SharkAuth:
         parsed = urlparse(self._token_url)
         self._auth_origin = f"{parsed.scheme}://{parsed.netloc}"
 
-        self._id_token: str | None = None
+        self._id_token: str | None = id_token
         self._access_token: str | None = None
-        self._refresh_token: str | None = None
-        self._token_expiry: float = 0
+        self._refresh_token: str | None = refresh_token
+        self._token_expiry: float = token_expiry
 
     @property
     def id_token(self) -> str | None:
@@ -111,24 +200,47 @@ class SharkAuth:
         return self._id_token
 
     @property
-    def user_id(self) -> str | None:
-        """Extract user ID from the JWT id_token sub claim."""
+    def refresh_token(self) -> str | None:
+        """Return the current refresh token."""
+        return self._refresh_token
+
+    @property
+    def token_expiry(self) -> float:
+        """Return the unix timestamp the access token expires at."""
+        return self._token_expiry
+
+    def _decode_id_token_claims(self) -> dict[str, Any]:
+        """Decode the JWT payload without verification (we trust Auth0).
+
+        Returns ``{}`` on any decode error so callers can use ``.get()``
+        without further defensive checks.
+        """
         if not self._id_token:
-            return None
+            return {}
         try:
-            # Decode JWT payload without verification (we trust Auth0)
             payload = self._id_token.split(".")[1]
-            # Add padding
             padding = 4 - len(payload) % 4
             if padding != 4:
                 payload += "=" * padding
-            claims = json.loads(base64.urlsafe_b64decode(payload))
-            sub = claims.get("sub", "")
-            # Auth0 sub format is "auth0|<user_id>"
-            return sub.split("|", 1)[1] if "|" in sub else sub
+            return json.loads(base64.urlsafe_b64decode(payload))
         except (IndexError, json.JSONDecodeError, ValueError):
-            LOGGER.error("Failed to extract user_id from id_token")
+            LOGGER.error("Failed to decode id_token claims")
+            return {}
+
+    @property
+    def user_id(self) -> str | None:
+        """Extract user ID from the JWT id_token sub claim."""
+        sub = self._decode_id_token_claims().get("sub", "")
+        if not sub:
             return None
+        # Auth0 sub format is "auth0|<user_id>"
+        return sub.split("|", 1)[1] if "|" in sub else sub
+
+    @property
+    def email(self) -> str | None:
+        """Extract email from the JWT id_token, if present."""
+        email = self._decode_id_token_claims().get("email")
+        return email if isinstance(email, str) and email else None
 
     @property
     def token_expiring_soon(self) -> bool:
@@ -140,35 +252,45 @@ class SharkAuth:
         """Check if we have valid tokens."""
         return self._id_token is not None and time.time() < self._token_expiry
 
-    async def async_sign_in(self) -> None:
-        """Authenticate via Auth0 password grant."""
+    async def async_exchange_code(
+        self, code: str, code_verifier: str
+    ) -> None:
+        """Exchange a PKCE authorization code for tokens.
+
+        Called once after the user pastes the redirect URL from their
+        browser. Populates id_token + refresh_token; from then on,
+        :meth:`async_refresh_auth` keeps the access token current.
+        """
         data = {
-            "grant_type": "http://auth0.com/oauth/grant-type/password-realm",
-            "realm": "Username-Password-Authentication",
+            "grant_type": "authorization_code",
             "client_id": self._client_id,
-            "username": self._username,
-            "password": self._password,
-            "scope": "openid email profile offline_access",
+            "code": code,
+            "code_verifier": code_verifier,
+            "redirect_uri": SHARKCLEAN_REDIRECT_URI,
         }
         await self._async_token_request(data)
 
     async def async_refresh_auth(self) -> None:
-        """Refresh authentication using the stored refresh token."""
+        """Refresh authentication using the stored refresh token.
+
+        Unlike a fresh login, refresh requests don't trigger Auth0's
+        ``requires_verification`` challenge — the refresh token itself
+        proves a previously-completed valid login. There's no fallback
+        path: if the refresh token is invalid the caller must restart
+        the PKCE flow, which they do by raising ``ConfigEntryAuthFailed``
+        from setup.
+        """
         if not self._refresh_token:
-            LOGGER.debug("No refresh token available, performing full sign-in")
-            await self.async_sign_in()
-            return
+            raise SharkAuthError(
+                "No refresh token available; user must complete PKCE flow"
+            )
 
         data = {
             "grant_type": "refresh_token",
             "client_id": self._client_id,
             "refresh_token": self._refresh_token,
         }
-        try:
-            await self._async_token_request(data)
-        except SharkAuthError:
-            LOGGER.debug("Refresh token failed, falling back to full sign-in")
-            await self.async_sign_in()
+        await self._async_token_request(data)
 
     async def _async_token_request(self, data: dict[str, str]) -> None:
         """Execute a token request against Auth0."""

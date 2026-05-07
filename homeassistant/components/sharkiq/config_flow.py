@@ -1,4 +1,21 @@
-"""Config flow for Shark IQ integration."""
+"""Config flow for Shark IQ integration.
+
+Auth uses PKCE / authorization-code-with-paste:
+
+1. ``async_step_user`` collects the region and generates a PKCE pair + state.
+2. ``async_step_authorize`` shows the user the Auth0 URL to open in their
+   browser. They log in (and complete any verification challenge interactively),
+   then paste the resulting redirect URL — Auth0's redirect goes to a
+   custom iOS app scheme the browser can't launch, but the URL bar still
+   contains ``?code=…``.
+3. We exchange the code at ``/oauth/token`` for refresh + id tokens and
+   persist them on the config entry. From then on, ``grant_type=refresh_token``
+   keeps things current — no further user interaction required.
+
+This is the only flow that reliably bypasses Auth0's ``requires_verification``
+challenge against SharkNinja's tenant; the password-realm grant gets server-IP
+fingerprinted and rejected.
+"""
 
 from __future__ import annotations
 
@@ -9,7 +26,6 @@ import socket
 from typing import Any
 
 import aiohttp
-from sharkiq import SharkIqAuthError, get_ayla_api
 import voluptuous as vol
 
 from homeassistant.config_entries import (
@@ -18,23 +34,24 @@ from homeassistant.config_entries import (
     ConfigFlowResult,
     OptionsFlowWithReload,
 )
-from homeassistant.const import CONF_PASSWORD, CONF_REGION, CONF_USERNAME
-from homeassistant.core import HomeAssistant, callback
-from homeassistant.exceptions import HomeAssistantError
+from homeassistant.const import CONF_REGION
+from homeassistant.core import callback
 from homeassistant.helpers import selector
 from homeassistant.helpers.aiohttp_client import async_create_clientsession
 
 from .auth import (
     SharkAuth,
     SharkAuthError,
-    SharkAuthInvalidCredentialsError,
-    SharkAuthRateLimitedError,
-    SharkAuthVerificationRequiredError,
-    raise_if_auth0_account_blocked,
+    build_authorize_url,
+    generate_pkce_pair,
+    parse_callback_input,
 )
 from .const import (
     CLEAN_TYPES,
+    CONF_ID_TOKEN,
     CONF_PRESETS,
+    CONF_REFRESH_TOKEN,
+    CONF_TOKEN_EXPIRY,
     DOMAIN,
     FAN_SPEED_NAMES,
     LOGGER,
@@ -49,10 +66,10 @@ from .const import (
     SHARKIQ_REGION_OPTIONS,
 )
 
-SHARKIQ_SCHEMA = vol.Schema(
+CONF_REDIRECT_INPUT = "redirect"
+
+SHARKIQ_REGION_SCHEMA = vol.Schema(
     {
-        vol.Required(CONF_USERNAME): str,
-        vol.Required(CONF_PASSWORD): str,
         vol.Required(
             CONF_REGION, default=SHARKIQ_REGION_DEFAULT
         ): selector.SelectSelector(
@@ -63,99 +80,28 @@ SHARKIQ_SCHEMA = vol.Schema(
     }
 )
 
-
-async def _validate_input(
-    hass: HomeAssistant, data: Mapping[str, Any]
-) -> dict[str, str]:
-    """Validate the user input allows us to connect.
-
-    Tries Auth0 direct auth first (for skegox), falls back to sharkiq library (Ayla).
-    """
-    europe = data.get(CONF_REGION) == SHARKIQ_REGION_EUROPE
-    websession = async_create_clientsession(
-        hass,
-        cookie_jar=aiohttp.CookieJar(unsafe=True, quote_cookie=False),
-        family=socket.AF_INET,
-    )
-
-    # Try Auth0 direct authentication first (works for both backends)
-    try:
-        async with asyncio.timeout(15):
-            auth = SharkAuth(
-                username=data[CONF_USERNAME],
-                password=data[CONF_PASSWORD],
-                websession=websession,
-                europe=europe,
-            )
-            await auth.async_sign_in()
-            LOGGER.debug("Auth0 direct authentication successful")
-            return {"title": data[CONF_USERNAME]}
-    except SharkAuthVerificationRequiredError as err:
-        # Both backends share the Auth0 tenant, so falling through to Ayla
-        # would just deepen the rate-limit hole. Surface the actionable error.
-        raise Auth0VerificationRequired(str(err)) from err
-    except SharkAuthRateLimitedError as err:
-        raise Auth0RateLimited(str(err)) from err
-    except SharkAuthInvalidCredentialsError as err:
-        raise InvalidAuth(str(err)) from err
-    except SharkAuthError as err:
-        LOGGER.debug("Auth0 direct auth failed: %s, trying Ayla fallback", err)
-    except TimeoutError:
-        LOGGER.debug("Auth0 direct auth timed out, trying Ayla fallback")
-
-    # Fall back to sharkiq library's auth (legacy Ayla path)
-    ayla_api = get_ayla_api(
-        username=data[CONF_USERNAME],
-        password=data[CONF_PASSWORD],
-        websession=websession,
-        europe=europe,
-    )
-
-    try:
-        async with asyncio.timeout(15):
-            LOGGER.debug("Initialize connection to Ayla networks API")
-            await ayla_api.async_sign_in()
-    except (TimeoutError, aiohttp.ClientError, TypeError) as error:
-        LOGGER.error(error)
-        raise CannotConnect(
-            "Unable to connect to SharkIQ services. Check your region settings."
-        ) from error
-    except SharkIqAuthError as error:
-        # The pip lib's SharkIqAuthError wraps Auth0 anti-fraud signals; check
-        # the message for known patterns before defaulting to invalid_auth.
-        try:
-            raise_if_auth0_account_blocked(error)
-        except SharkAuthVerificationRequiredError as err:
-            raise Auth0VerificationRequired(str(err)) from err
-        except SharkAuthRateLimitedError as err:
-            raise Auth0RateLimited(str(err)) from err
-        LOGGER.error(error)
-        raise InvalidAuth(
-            "Username or password incorrect. Please check your credentials."
-        ) from error
-    except Exception as error:
-        # The pip lib leaks unwrapped auth0.exceptions.Auth0Error on its
-        # cookie-fallback path; same message-sniffing handles it.
-        try:
-            raise_if_auth0_account_blocked(error)
-        except SharkAuthVerificationRequiredError as err:
-            raise Auth0VerificationRequired(str(err)) from err
-        except SharkAuthRateLimitedError as err:
-            raise Auth0RateLimited(str(err)) from err
-        LOGGER.exception("Unexpected exception")
-        LOGGER.error(error)
-        raise UnknownAuth(
-            "An unknown error occurred. Check your region settings and open an issue on Github if the issue persists."
-        ) from error
-
-    # Return info that you want to store in the config entry.
-    return {"title": data[CONF_USERNAME]}
+SHARKIQ_REDIRECT_SCHEMA = vol.Schema(
+    {
+        vol.Required(CONF_REDIRECT_INPUT): str,
+    }
+)
 
 
 class SharkIqConfigFlow(ConfigFlow, domain=DOMAIN):
     """Handle a config flow for Shark IQ."""
 
-    VERSION = 1
+    VERSION = 2
+
+    def __init__(self) -> None:
+        """Initialize the flow's PKCE state."""
+        self._region: str = SHARKIQ_REGION_DEFAULT
+        self._europe: bool = False
+        self._pkce_verifier: str = ""
+        self._pkce_challenge: str = ""
+        self._pkce_state: str = ""
+        # Set during reauth so we update the existing entry instead of
+        # creating a new one.
+        self._reauth_entry: ConfigEntry | None = None
 
     @staticmethod
     @callback
@@ -165,98 +111,138 @@ class SharkIqConfigFlow(ConfigFlow, domain=DOMAIN):
         """Return the options flow for managing cleaning presets."""
         return SharkIqOptionsFlow()
 
-    async def _async_validate_input(
-        self, user_input: Mapping[str, Any]
-    ) -> tuple[dict[str, str] | None, dict[str, str]]:
-        """Validate form input."""
-        errors = {}
-        info = None
-
-        # noinspection PyBroadException
-        try:
-            info = await _validate_input(self.hass, user_input)
-        except CannotConnect:
-            errors["base"] = "cannot_connect"
-        except Auth0VerificationRequired:
-            errors["base"] = "auth0_verification"
-        except Auth0RateLimited:
-            errors["base"] = "auth0_rate_limited"
-        except InvalidAuth:
-            errors["base"] = "invalid_auth"
-        except UnknownAuth:
-            errors["base"] = "unknown"
-        return info, errors
-
     async def async_step_user(
-        self, user_input: dict[str, str] | None = None
+        self, user_input: dict[str, Any] | None = None
     ) -> ConfigFlowResult:
-        """Handle the initial step."""
-        errors: dict[str, str] = {}
+        """Pick the region, then transition to authorization."""
         if user_input is not None:
-            info, errors = await self._async_validate_input(user_input)
-            if info:
-                await self.async_set_unique_id(user_input[CONF_USERNAME])
-                self._abort_if_unique_id_configured()
-                return self.async_create_entry(title=info["title"], data=user_input)
+            self._region = user_input[CONF_REGION]
+            self._europe = self._region == SHARKIQ_REGION_EUROPE
+            self._pkce_verifier, self._pkce_challenge = generate_pkce_pair()
+            self._pkce_state = secrets.token_urlsafe(32)
+            return await self.async_step_authorize()
 
         return self.async_show_form(
-            step_id="user", data_schema=SHARKIQ_SCHEMA, errors=errors
+            step_id="user",
+            data_schema=SHARKIQ_REGION_SCHEMA,
         )
+
+    async def async_step_authorize(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        """Show the Auth0 URL and exchange the pasted callback for tokens."""
+        errors: dict[str, str] = {}
+        auth_url = build_authorize_url(
+            europe=self._europe,
+            code_challenge=self._pkce_challenge,
+            state=self._pkce_state,
+        )
+
+        if user_input is not None:
+            try:
+                code, state = parse_callback_input(user_input[CONF_REDIRECT_INPUT])
+            except ValueError:
+                errors["base"] = "invalid_redirect"
+            else:
+                # If the redirect URL contained a state, verify it matches what
+                # we generated to defend against the user pasting an old or
+                # cross-flow redirect. A bare ``code`` without state can't be
+                # verified, but the user has to actively paste it so the
+                # CSRF risk is minimal.
+                if state is not None and state != self._pkce_state:
+                    errors["base"] = "invalid_state"
+                else:
+                    info, exchange_errors = await self._async_exchange_for_tokens(code)
+                    if info is not None:
+                        return await self._async_finalize_entry(info)
+                    errors.update(exchange_errors)
+
+        return self.async_show_form(
+            step_id="authorize",
+            data_schema=SHARKIQ_REDIRECT_SCHEMA,
+            description_placeholders={"auth_url": auth_url},
+            errors=errors,
+        )
+
+    async def _async_exchange_for_tokens(
+        self, code: str
+    ) -> tuple[dict[str, Any] | None, dict[str, str]]:
+        """Exchange a PKCE authorization code for tokens.
+
+        Returns ``(info, errors)``. ``info`` carries the entry payload
+        when successful; on failure it is None and ``errors`` populates
+        the form's error map.
+        """
+        websession = async_create_clientsession(
+            self.hass,
+            cookie_jar=aiohttp.CookieJar(unsafe=True, quote_cookie=False),
+            family=socket.AF_INET,
+        )
+        auth = SharkAuth(websession=websession, europe=self._europe)
+        try:
+            async with asyncio.timeout(15):
+                await auth.async_exchange_code(code, self._pkce_verifier)
+        except TimeoutError:
+            LOGGER.debug("PKCE token exchange timed out")
+            return None, {"base": "cannot_connect"}
+        except SharkAuthError as err:
+            LOGGER.error("PKCE token exchange failed: %s", err)
+            return None, {"base": "invalid_auth"}
+
+        if not auth.refresh_token or not auth.id_token:
+            LOGGER.error("PKCE token exchange returned no tokens")
+            return None, {"base": "unknown"}
+
+        info: dict[str, Any] = {
+            "user_id": auth.user_id,
+            "title": auth.email or auth.user_id or "Shark IQ",
+            "data": {
+                CONF_REGION: self._region,
+                CONF_REFRESH_TOKEN: auth.refresh_token,
+                CONF_ID_TOKEN: auth.id_token,
+                CONF_TOKEN_EXPIRY: auth.token_expiry,
+            },
+        }
+        return info, {}
+
+    async def _async_finalize_entry(
+        self, info: dict[str, Any]
+    ) -> ConfigFlowResult:
+        """Create or update the config entry with newly-acquired tokens."""
+        if self._reauth_entry is not None:
+            # Preserve fields the reauth flow shouldn't touch (backend
+            # selection, options) by merging into existing data.
+            updated_data = {**self._reauth_entry.data, **info["data"]}
+            self.hass.config_entries.async_update_entry(
+                self._reauth_entry, data=updated_data
+            )
+            await self.hass.config_entries.async_reload(self._reauth_entry.entry_id)
+            return self.async_abort(reason="reauth_successful")
+
+        # New entry. Use Auth0 ``sub`` as unique_id — stable across email
+        # changes and never empty for a successful exchange.
+        if info["user_id"]:
+            await self.async_set_unique_id(info["user_id"])
+            self._abort_if_unique_id_configured()
+        return self.async_create_entry(title=info["title"], data=info["data"])
 
     async def async_step_reauth(
         self, entry_data: Mapping[str, Any]
     ) -> ConfigFlowResult:
-        """Handle re-auth if login is invalid."""
-        return await self.async_step_reauth_confirm()
-
-    async def async_step_reauth_confirm(
-        self, user_input: dict[str, Any] | None = None
-    ) -> ConfigFlowResult:
-        """Handle a flow initiated by reauthentication."""
-        errors: dict[str, str] = {}
-
-        if user_input is not None:
-            _, errors = await self._async_validate_input(user_input)
-
-            if not errors:
-                errors = {"base": "unknown"}
-                if entry := await self.async_set_unique_id(self.unique_id):
-                    self.hass.config_entries.async_update_entry(entry, data=user_input)
-                    return self.async_abort(reason="reauth_successful")
-
-            # Stay on the form for retryable errors so the user can fix the
-            # underlying issue (clear the Auth0 verification, fix credentials,
-            # wait out the rate limit) and submit again. Only abort on
-            # terminal failures.
-            retryable = {"invalid_auth", "auth0_verification", "auth0_rate_limited"}
-            if errors["base"] not in retryable:
-                return self.async_abort(reason=errors["base"])
-
-        return self.async_show_form(
-            step_id="reauth_confirm",
-            data_schema=SHARKIQ_SCHEMA,
-            errors=errors,
+        """Trigger reauth — same PKCE flow as initial setup."""
+        self._reauth_entry = self.hass.config_entries.async_get_entry(
+            self.context["entry_id"]
         )
+        if self._reauth_entry is not None:
+            self._region = self._reauth_entry.data.get(
+                CONF_REGION, SHARKIQ_REGION_DEFAULT
+            )
+            self._europe = self._region == SHARKIQ_REGION_EUROPE
+        self._pkce_verifier, self._pkce_challenge = generate_pkce_pair()
+        self._pkce_state = secrets.token_urlsafe(32)
+        return await self.async_step_authorize()
 
 
-class CannotConnect(HomeAssistantError):
-    """Error to indicate we cannot connect."""
-
-
-class InvalidAuth(HomeAssistantError):
-    """Error to indicate there is invalid auth."""
-
-
-class UnknownAuth(HomeAssistantError):
-    """Error to indicate there is an uncaught auth error."""
-
-
-class Auth0VerificationRequired(HomeAssistantError):
-    """Auth0 anti-fraud has flagged this account/IP and requires interactive verification."""
-
-
-class Auth0RateLimited(HomeAssistantError):
-    """Auth0 has temporarily blocked the account after too many failed attempts."""
 
 
 class SharkIqOptionsFlow(OptionsFlowWithReload):

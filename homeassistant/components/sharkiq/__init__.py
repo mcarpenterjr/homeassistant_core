@@ -1,19 +1,15 @@
 """Shark IQ integration.
 
-Supports both backends SharkNinja has used:
+Authentication uses PKCE / authorization-code-with-paste against
+SharkNinja's Auth0 tenant — see :mod:`auth` and the config flow for
+details. Tokens are persisted on the config entry; setup refreshes
+the access token if it's near expiry, and a refresh failure raises
+:class:`ConfigEntryAuthFailed` to trigger a fresh PKCE flow.
 
-- **Skegox** (``thor.skegox.com``): the current backend. Auth via Auth0
-  password grant; device data via a JSON shadow API. Implemented in
-  :mod:`auth` and :mod:`skegox`. Newer hybrid models (RV2500AX et al.)
-  use a slightly different shadow schema with value/timestamp wrappers
-  and an ``items`` collection key — both are handled.
-- **Ayla Networks**: the legacy backend used before SharkNinja's API
-  migration. Wraps the upstream ``sharkiq`` PyPI library.
-
-``async_setup_entry`` tries Skegox first (covers freshly-migrated
-accounts which return 0 devices on Ayla), falls back to Ayla if the
-account hasn't been migrated, and remembers the working backend in
-``config_entry.data["backend"]`` so subsequent loads skip straight to it.
+Device data flows through the modern ``thor.skegox.com`` REST API
+(:mod:`skegox`). Newer hybrid models (RV2500AX et al.) use a slightly
+different shadow schema with value/timestamp wrappers and an ``items``
+collection key — both are handled.
 
 The integration polls because the skegox REST API has no push channel.
 The coordinator's interval adapts to vacuum activity (30 s while
@@ -22,39 +18,28 @@ sticks for 15 minutes past the last successful refresh so transient
 network failures don't flap the entity state.
 """
 
+from __future__ import annotations
+
 import asyncio
-from contextlib import suppress
 import socket
 
 import aiohttp
-from sharkiq import (
-    AylaApi,
-    SharkIqAuthError,
-    SharkIqAuthExpiringError,
-    SharkIqNotAuthedError,
-    get_ayla_api,
-)
 
 from homeassistant import exceptions
-from homeassistant.const import CONF_PASSWORD, CONF_REGION, CONF_USERNAME
+from homeassistant.const import CONF_REGION
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers import config_validation as cv, entity_registry as er
 from homeassistant.helpers.aiohttp_client import async_create_clientsession
 from homeassistant.helpers.typing import ConfigType
 
-from .auth import (
-    SharkAuth,
-    SharkAuthError,
-    SharkAuthInvalidCredentialsError,
-    SharkAuthRateLimitedError,
-    SharkAuthVerificationRequiredError,
-    raise_if_auth0_account_blocked,
-)
+from .auth import SharkAuth, SharkAuthError
 from .const import (
     API_TIMEOUT,
-    BACKEND_AYLA,
     BACKEND_SKEGOX,
     CONF_BACKEND,
+    CONF_ID_TOKEN,
+    CONF_REFRESH_TOKEN,
+    CONF_TOKEN_EXPIRY,
     DOMAIN,
     LOGGER,
     PLATFORMS,
@@ -68,139 +53,35 @@ from .skegox import SkegoxApi, SkegoxApiError
 CONFIG_SCHEMA = cv.config_entry_only_config_schema(DOMAIN)
 
 
-class CannotConnect(exceptions.HomeAssistantError):
-    """Error to indicate we cannot connect."""
-
-
-async def async_connect_or_timeout(ayla_api: AylaApi) -> bool:
-    """Connect to vacuum via Ayla."""
-    try:
-        async with asyncio.timeout(API_TIMEOUT):
-            LOGGER.debug("Initialize connection to Ayla networks API")
-            await ayla_api.async_sign_in()
-    except SharkIqAuthError as err:
-        raise_if_auth0_account_blocked(err)
-        LOGGER.error("Authentication error connecting to Shark IQ api")
-        return False
-    except TimeoutError as exc:
-        LOGGER.error("Timeout expired")
-        raise CannotConnect from exc
-    except (aiohttp.ClientError, OSError) as exc:
-        LOGGER.debug("Network error connecting to Ayla: %s", exc)
-        raise CannotConnect from exc
-    except Exception as err:
-        # The pip sharkiq lib lets auth0.exceptions.Auth0Error leak through
-        # unwrapped on its legacy_cookie_sign_in path; classify it here so we
-        # don't end up with "Unexpected exception" for a known failure mode.
-        raise_if_auth0_account_blocked(err)
-        raise
-
-    return True
-
-
-async def _async_setup_skegox(
-    hass: HomeAssistant,
-    config_entry: SharkIqConfigEntry,
-    websession: aiohttp.ClientSession,
-    europe: bool,
-) -> SharkIqUpdateCoordinator | None:
-    """Try to set up via the skegox backend."""
-    auth = SharkAuth(
-        username=config_entry.data[CONF_USERNAME],
-        password=config_entry.data[CONF_PASSWORD],
-        websession=websession,
-        europe=europe,
-    )
-
-    try:
-        async with asyncio.timeout(API_TIMEOUT):
-            await auth.async_sign_in()
-    except (
-        SharkAuthVerificationRequiredError,
-        SharkAuthRateLimitedError,
-        SharkAuthInvalidCredentialsError,
-    ):
-        # Account-level Auth0 failures: don't fall through to Ayla, since
-        # both backends share the same Auth0 tenant. Bubble up to setup_entry
-        # which converts to ConfigEntryAuthFailed / ConfigEntryNotReady.
-        raise
-    except (SharkAuthError, TimeoutError) as err:
-        LOGGER.debug("Skegox auth failed: %s", err)
-        return None
-
-    skegox_api = SkegoxApi(auth, websession, europe=europe)
-
-    try:
-        async with asyncio.timeout(API_TIMEOUT):
-            devices = await skegox_api.async_get_devices()
-    except (SkegoxApiError, SharkAuthError, TimeoutError) as err:
-        LOGGER.debug("Skegox device discovery failed: %s", err)
-        return None
-
-    if not devices:
-        LOGGER.debug("Skegox returned 0 devices")
-        return None
-
-    device_names = ", ".join(d.name for d in devices)
-    LOGGER.info(
-        "Found %d device(s) via skegox backend: %s", len(devices), device_names
-    )
-
-    return SharkIqUpdateCoordinator(
-        hass,
-        config_entry,
-        shark_vacs=devices,
-        skegox_api=skegox_api,
-    )
-
-
-async def _async_setup_ayla(
-    hass: HomeAssistant,
-    config_entry: SharkIqConfigEntry,
-    websession: aiohttp.ClientSession,
-    europe: bool,
-) -> SharkIqUpdateCoordinator | None:
-    """Try to set up via the Ayla backend."""
-    ayla_api = get_ayla_api(
-        username=config_entry.data[CONF_USERNAME],
-        password=config_entry.data[CONF_PASSWORD],
-        websession=websession,
-        europe=europe,
-    )
-
-    try:
-        if not await async_connect_or_timeout(ayla_api):
-            return None
-    except CannotConnect:
-        return None
-
-    try:
-        async with asyncio.timeout(API_TIMEOUT):
-            shark_vacs = await ayla_api.async_get_devices(False)
-    except (SharkIqAuthError, aiohttp.ClientError, TimeoutError):
-        LOGGER.debug("Ayla device discovery failed", exc_info=True)
-        return None
-
-    if not shark_vacs:
-        LOGGER.debug("Ayla returned 0 devices")
-        return None
-
-    device_names = ", ".join(d.name for d in shark_vacs)
-    LOGGER.info(
-        "Found %d device(s) via Ayla backend: %s", len(shark_vacs), device_names
-    )
-
-    return SharkIqUpdateCoordinator(
-        hass,
-        config_entry,
-        shark_vacs=shark_vacs,
-        ayla_api=ayla_api,
-    )
-
-
 async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
     """Set up the component."""
     async_setup_services(hass)
+    return True
+
+
+async def async_migrate_entry(
+    hass: HomeAssistant, config_entry: SharkIqConfigEntry
+) -> bool:
+    """Migrate older entries to PKCE-based auth.
+
+    Version 1 entries stored ``username`` / ``password`` for the password
+    grant flow. Auth0 anti-fraud now rejects that grant, so v2 only stores
+    refresh + id tokens obtained via the PKCE flow. Strip credentials and
+    let HA trigger reauth (which runs the new flow) on next setup.
+    """
+    if config_entry.version == 1:
+        LOGGER.info(
+            "Migrating Shark IQ config entry %s from v1 (password) to v2 (PKCE)",
+            config_entry.entry_id,
+        )
+        new_data = {
+            CONF_REGION: config_entry.data.get(CONF_REGION, SHARKIQ_REGION_DEFAULT),
+        }
+        if (backend := config_entry.data.get(CONF_BACKEND)) is not None:
+            new_data[CONF_BACKEND] = backend
+        hass.config_entries.async_update_entry(
+            config_entry, data=new_data, version=2
+        )
     return True
 
 
@@ -208,13 +89,15 @@ async def async_setup_entry(
     hass: HomeAssistant, config_entry: SharkIqConfigEntry
 ) -> bool:
     """Initialize the sharkiq platform via config entry."""
-    if CONF_REGION not in config_entry.data:
-        hass.config_entries.async_update_entry(
-            config_entry,
-            data={**config_entry.data, CONF_REGION: SHARKIQ_REGION_DEFAULT},
-        )
-
     europe = config_entry.data.get(CONF_REGION) == SHARKIQ_REGION_EUROPE
+
+    refresh_token = config_entry.data.get(CONF_REFRESH_TOKEN)
+    if not refresh_token:
+        # No tokens means a freshly-migrated v1 entry or one whose user
+        # cleared them — either way, the user needs to do PKCE again.
+        raise exceptions.ConfigEntryAuthFailed(
+            "Shark IQ needs to be re-authorized via the SharkClean login flow"
+        )
 
     websession = async_create_clientsession(
         hass,
@@ -222,57 +105,66 @@ async def async_setup_entry(
         family=socket.AF_INET,
     )
 
-    coordinator: SharkIqUpdateCoordinator | None = None
-    stored_backend = config_entry.data.get(CONF_BACKEND)
+    auth = SharkAuth(
+        websession=websession,
+        europe=europe,
+        refresh_token=refresh_token,
+        id_token=config_entry.data.get(CONF_ID_TOKEN),
+        token_expiry=config_entry.data.get(CONF_TOKEN_EXPIRY, 0),
+    )
+
+    # Refresh the access token whenever it's missing, expired, or within the
+    # 10-minute "expiring soon" window. Refresh requests don't trigger
+    # ``requires_verification`` so this is the steady-state path; a refresh
+    # failure means the refresh token itself is no longer valid and we have
+    # to fall back to a fresh PKCE flow via reauth.
+    if not auth.is_authenticated or auth.token_expiring_soon:
+        try:
+            async with asyncio.timeout(API_TIMEOUT):
+                await auth.async_refresh_auth()
+        except SharkAuthError as err:
+            LOGGER.warning("Shark IQ token refresh failed: %s", err)
+            raise exceptions.ConfigEntryAuthFailed(str(err)) from err
+        except TimeoutError as err:
+            raise exceptions.ConfigEntryNotReady(
+                "Timed out refreshing Shark IQ token"
+            ) from err
+        _persist_tokens(hass, config_entry, auth)
+
+    skegox_api = SkegoxApi(auth, websession, europe=europe)
 
     try:
-        # Try backends in order of preference
-        if stored_backend != BACKEND_AYLA:
-            # Try skegox first (newer backend, accounts are being migrated to it)
-            coordinator = await _async_setup_skegox(
-                hass, config_entry, websession, europe
-            )
-            if coordinator:
-                _update_backend(hass, config_entry, BACKEND_SKEGOX)
-
-        if coordinator is None and stored_backend != BACKEND_SKEGOX:
-            # Fall back to Ayla (legacy backend)
-            coordinator = await _async_setup_ayla(
-                hass, config_entry, websession, europe
-            )
-            if coordinator:
-                _update_backend(hass, config_entry, BACKEND_AYLA)
-
-        if coordinator is None:
-            # Try whichever we haven't tried yet
-            if stored_backend == BACKEND_AYLA:
-                coordinator = await _async_setup_skegox(
-                    hass, config_entry, websession, europe
-                )
-                if coordinator:
-                    _update_backend(hass, config_entry, BACKEND_SKEGOX)
-            elif stored_backend == BACKEND_SKEGOX:
-                coordinator = await _async_setup_ayla(
-                    hass, config_entry, websession, europe
-                )
-                if coordinator:
-                    _update_backend(hass, config_entry, BACKEND_AYLA)
-    except SharkAuthVerificationRequiredError as err:
-        # Auth0 anti-fraud has flagged the account/IP. The user must clear it
-        # via the SharkClean app on this network — code retries can't help and
-        # only deepen the rate-limit, so flip to reauth and stop hammering.
+        async with asyncio.timeout(API_TIMEOUT):
+            devices = await skegox_api.async_get_devices()
+    except SharkAuthError as err:
         raise exceptions.ConfigEntryAuthFailed(str(err)) from err
-    except SharkAuthRateLimitedError as err:
-        # 429 from Auth0. ConfigEntryNotReady so HA's exponential backoff kicks
-        # in instead of a tight retry loop that would prolong the block.
-        raise exceptions.ConfigEntryNotReady(str(err)) from err
-    except SharkAuthInvalidCredentialsError as err:
-        raise exceptions.ConfigEntryAuthFailed(str(err)) from err
-
-    if coordinator is None:
+    except (SkegoxApiError, TimeoutError, aiohttp.ClientError) as err:
         raise exceptions.ConfigEntryNotReady(
-            "Could not connect to SharkIQ via either Ayla or Skegox backend"
+            f"Failed to load Shark IQ devices: {err}"
+        ) from err
+
+    if not devices:
+        raise exceptions.ConfigEntryNotReady(
+            "Skegox returned 0 devices for this account"
         )
+
+    device_names = ", ".join(d.name for d in devices)
+    LOGGER.info(
+        "Found %d device(s) via skegox backend: %s", len(devices), device_names
+    )
+
+    if config_entry.data.get(CONF_BACKEND) != BACKEND_SKEGOX:
+        hass.config_entries.async_update_entry(
+            config_entry,
+            data={**config_entry.data, CONF_BACKEND: BACKEND_SKEGOX},
+        )
+
+    coordinator = SharkIqUpdateCoordinator(
+        hass,
+        config_entry,
+        shark_vacs=devices,
+        skegox_api=skegox_api,
+    )
 
     await coordinator.async_config_entry_first_refresh()
 
@@ -287,6 +179,30 @@ async def async_setup_entry(
     async_refresh_clean_room_schema(hass)
 
     return True
+
+
+def _persist_tokens(
+    hass: HomeAssistant,
+    config_entry: SharkIqConfigEntry,
+    auth: SharkAuth,
+) -> None:
+    """Write the latest tokens back to the config entry.
+
+    Refresh-token rotation is on for SharkNinja's Auth0 tenant — every
+    refresh response can include a new refresh_token that supersedes the
+    one we used. Persist after each refresh so the next HA restart isn't
+    holding a stale token that's about to be revoked.
+    """
+    if auth.refresh_token is None or auth.id_token is None:
+        return
+    new_data = {
+        **config_entry.data,
+        CONF_REFRESH_TOKEN: auth.refresh_token,
+        CONF_ID_TOKEN: auth.id_token,
+        CONF_TOKEN_EXPIRY: auth.token_expiry,
+    }
+    if new_data != dict(config_entry.data):
+        hass.config_entries.async_update_entry(config_entry, data=new_data)
 
 
 def _all_loaded_coordinators(
@@ -356,39 +272,8 @@ def _async_remove_orphan_entities(
                 break
 
 
-def _update_backend(
-    hass: HomeAssistant, config_entry: SharkIqConfigEntry, backend: str
-) -> None:
-    """Store the working backend in config entry data."""
-    if config_entry.data.get(CONF_BACKEND) != backend:
-        hass.config_entries.async_update_entry(
-            config_entry,
-            data={**config_entry.data, CONF_BACKEND: backend},
-        )
-
-
-async def async_disconnect_or_timeout(coordinator: SharkIqUpdateCoordinator) -> None:
-    """Disconnect from API."""
-    LOGGER.debug("Disconnecting from Shark API")
-    async with asyncio.timeout(5):
-        if coordinator.ayla_api is not None:
-            with suppress(
-                SharkIqAuthError, SharkIqAuthExpiringError, SharkIqNotAuthedError
-            ):
-                await coordinator.ayla_api.async_sign_out()
-
-
 async def async_unload_entry(
     hass: HomeAssistant, config_entry: SharkIqConfigEntry
 ) -> bool:
-    """Unload a config entry."""
-    unload_ok = await hass.config_entries.async_unload_platforms(
-        config_entry, PLATFORMS
-    )
-    if unload_ok:
-        with suppress(SharkIqAuthError):
-            await async_disconnect_or_timeout(coordinator=config_entry.runtime_data)
-        # Drop this entry's rooms from the service dropdown.
-        async_refresh_clean_room_schema(hass)
-
-    return unload_ok
+    """Unload a sharkiq config entry."""
+    return await hass.config_entries.async_unload_platforms(config_entry, PLATFORMS)

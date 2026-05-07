@@ -10,28 +10,33 @@
       "cannot_connect": "[%key:common::config_flow::error::cannot_connect%]",
       "invalid_auth": "[%key:common::config_flow::error::invalid_auth%]",
       "unknown": "[%key:common::config_flow::error::unknown%]",
-      "auth0_verification": "Auth0 verification required. Open the SharkClean mobile app on a phone connected to the same network as Home Assistant, sign in to clear the verification challenge, then submit this form again.",
-      "auth0_rate_limited": "Too many failed login attempts — Auth0 has temporarily blocked the account. Wait at least 30 minutes before retrying; further attempts while blocked may extend the lockout."
+      "invalid_redirect": "Couldn't find an authorization code in the input. Paste the entire URL from your browser's address bar (or just the value of the `code=` query parameter).",
+      "invalid_state": "The pasted URL doesn't match this login attempt. Restart the flow and try again."
     },
     "flow_title": "Add Shark IQ account",
     "step": {
-      "reauth_confirm": {
-        "data": {
-          "password": "[%key:common::config_flow::data::password%]",
-          "region": "Region",
-          "username": "[%key:common::config_flow::data::username%]"
-        }
-      },
       "user": {
         "data": {
-          "password": "[%key:common::config_flow::data::password%]",
-          "region": "Region",
-          "username": "[%key:common::config_flow::data::username%]"
+          "region": "Region"
         },
         "data_description": {
           "region": "Shark IQ uses different services in the EU. Select your region to connect to the correct service for your account."
         },
-        "description": "Sign in to your SharkClean account to control your devices."
+        "description": "Connect your SharkClean account to control your devices."
+      },
+      "authorize": {
+        "title": "Authorize Home Assistant",
+        "description": "1. Open this URL in a browser on a device where you can sign in to SharkClean:\n\n    {auth_url}\n\n2. Sign in and complete any verification SharkNinja prompts you for.\n3. Your browser will try to open `com.sharkninja.shark://...` and show an error — that's expected. Copy the full URL from the address bar (it contains `?code=...`) and paste it below.",
+        "data": {
+          "redirect": "Redirect URL or authorization code"
+        }
+      },
+      "reauth_confirm": {
+        "title": "Re-authorize Home Assistant",
+        "description": "1. Open this URL in a browser on a device where you can sign in to SharkClean:\n\n    {auth_url}\n\n2. Sign in and complete any verification SharkNinja prompts you for.\n3. Copy the full URL from the address bar after redirect and paste it below.",
+        "data": {
+          "redirect": "Redirect URL or authorization code"
+        }
       }
     }
   },

@@ -1,6 +1,11 @@
 """Constants used in shark iq tests."""
 
-from homeassistant.const import CONF_PASSWORD, CONF_REGION, CONF_USERNAME
+from homeassistant.components.sharkiq.const import (
+    CONF_ID_TOKEN,
+    CONF_REFRESH_TOKEN,
+    CONF_TOKEN_EXPIRY,
+)
+from homeassistant.const import CONF_REGION
 
 # Dummy device dict of the form returned by AylaApi.list_devices()
 SHARK_DEVICE_DICT = {
@@ -72,17 +77,17 @@ SHARK_PROPERTIES_DICT = {
     },
 }
 
-TEST_USERNAME = "test-username"
-TEST_PASSWORD = "test-password"
 TEST_REGION = "elsewhere"
-UNIQUE_ID = "foo@bar.com"
+TEST_REFRESH_TOKEN = "test-refresh-token"
+TEST_ID_TOKEN = "test-id-token"
+TEST_TOKEN_EXPIRY = 9_999_999_999.0
+# unique_id is the Auth0 sub claim from the id_token; used for entry
+# matching during reauth and to abort duplicates on first setup.
+UNIQUE_ID = "auth0|user-sub"
 CONFIG = {
-    CONF_USERNAME: TEST_USERNAME,
-    CONF_PASSWORD: TEST_PASSWORD,
     CONF_REGION: TEST_REGION,
-}
-CONFIG_NO_REGION = {
-    CONF_USERNAME: TEST_USERNAME,
-    CONF_PASSWORD: TEST_PASSWORD,
+    CONF_REFRESH_TOKEN: TEST_REFRESH_TOKEN,
+    CONF_ID_TOKEN: TEST_ID_TOKEN,
+    CONF_TOKEN_EXPIRY: TEST_TOKEN_EXPIRY,
 }
 ENTRY_ID = "0123456789abcdef0123456789abcdef"

@@ -58,11 +58,33 @@ PRESET_ROOMS = "rooms"
 PRESET_CLEAN_TYPE = "clean_type"
 PRESET_FAN_SPEED = "fan_speed"
 
-# Auth0 settings
+# Auth0 settings.
+#
+# These are the SharkClean iOS app's public OAuth client credentials, which
+# is what the integration's PKCE flow targets — using them means Auth0
+# treats our requests as legitimate app traffic and runs any verification
+# challenges interactively in the user's browser, rather than rejecting
+# server-initiated logins outright with `requires_verification`.
 AUTH0_CLIENT_ID_US = "wsguxrqm77mq4LtrTrwg8ZJUxmSrexGi"
 AUTH0_CLIENT_ID_EU = "rKDx9O18dBrY3eoJMTkRiBZHDvd9Mx1I"
 AUTH0_TOKEN_URL_US = "https://login.sharkninja.com/oauth/token"
 AUTH0_TOKEN_URL_EU = "https://logineu.sharkninja.com/oauth/token"
+AUTH0_AUTHORIZE_URL_US = "https://login.sharkninja.com/authorize"
+AUTH0_AUTHORIZE_URL_EU = "https://logineu.sharkninja.com/authorize"
+# Custom URI scheme registered by the SharkClean iOS app. Auth0 redirects
+# here with the authorization code; desktop browsers fail to launch the
+# scheme but still surface the URL with the ``code`` query param, which
+# the user copies and pastes back into the config flow.
+SHARKCLEAN_REDIRECT_URI = (
+    "com.sharkninja.shark://login.sharkninja.com/ios/com.sharkninja.shark/callback"
+)
+AUTH0_SCOPES = "openid email profile offline_access"
+# Stored token fields on ``config_entry.data``. We keep the refresh token
+# and id_token from a successful PKCE exchange; the password is never
+# stored or asked for.
+CONF_REFRESH_TOKEN = "refresh_token"
+CONF_ID_TOKEN = "id_token"
+CONF_TOKEN_EXPIRY = "token_expiry"
 
 # Skegox API settings
 SKEGOX_BASE_URL_US = "https://stakra.slatra.thor.skegox.com"

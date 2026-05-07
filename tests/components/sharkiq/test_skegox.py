@@ -9,8 +9,15 @@ from unittest.mock import patch
 import pytest
 
 from homeassistant.components.sharkiq.auth import SharkAuth
-from homeassistant.components.sharkiq.const import ATTR_ROOMS, CONF_BACKEND, DOMAIN
-from homeassistant.components.sharkiq.coordinator import SharkIqUpdateCoordinator
+from homeassistant.components.sharkiq.const import (
+    ATTR_ROOMS,
+    BACKEND_SKEGOX,
+    CONF_BACKEND,
+    CONF_ID_TOKEN,
+    CONF_REFRESH_TOKEN,
+    CONF_TOKEN_EXPIRY,
+    DOMAIN,
+)
 from homeassistant.components.sharkiq.skegox import SkegoxApi, SkegoxDevice
 from homeassistant.components.sharkiq.vacuum import (
     ATTR_ERROR_CODE,
@@ -25,12 +32,7 @@ from homeassistant.components.vacuum import (
     VacuumActivity,
     VacuumEntityFeature,
 )
-from homeassistant.const import (
-    ATTR_SUPPORTED_FEATURES,
-    CONF_PASSWORD,
-    CONF_REGION,
-    CONF_USERNAME,
-)
+from homeassistant.const import ATTR_SUPPORTED_FEATURES, CONF_REGION
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers import device_registry as dr, entity_registry as er
 
@@ -73,9 +75,9 @@ SKEGOX_DEVICE_DATA: dict[str, Any] = {
     },
 }
 
-TEST_USERNAME = "test-username"
-TEST_PASSWORD = "test-password"
 TEST_REGION = "elsewhere"
+TEST_REFRESH_TOKEN = "test-refresh-token"
+TEST_ID_TOKEN = "test-id-token"
 ENTRY_ID = "skegox_entry_0123456789abcdef"
 VAC_ENTITY_ID = "vacuum.sharknado"
 ROOM_LIST = ["Kitchen", "Living Room"]
@@ -99,10 +101,8 @@ class MockSkegoxAuth(SharkAuth):
         """Initialize without calling super."""
         self._id_token = "fake.eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJhdXRoMHwxMjM0NTY3ODkwIiwiZW1haWwiOiJ0ZXN0QGV4YW1wbGUuY29tIn0.fake"
         self._access_token = "fake_access_token"
-        self._refresh_token = "fake_refresh_token"
-        self._token_expiry = 9999999999.0
-        self._username = TEST_USERNAME
-        self._password = TEST_PASSWORD
+        self._refresh_token = TEST_REFRESH_TOKEN
+        self._token_expiry = 9_999_999_999.0
         self._europe = False
 
     @property
@@ -189,15 +189,26 @@ class MockSkegoxApi(SkegoxApi):
 
 @pytest.fixture(autouse=True)
 async def setup_skegox_integration(hass: HomeAssistant) -> None:
-    """Build the mock skegox integration."""
+    """Build the mock skegox integration.
+
+    The fixture mocks at the boundary (SharkAuth refresh, SkegoxApi device
+    list) rather than at the integration's internal helpers — that lets
+    the real ``async_setup_entry`` run end to end and exercises the new
+    PKCE token-restore code path.
+    """
     entry = MockConfigEntry(
         domain=DOMAIN,
-        unique_id=TEST_USERNAME,
+        unique_id="auth0|user-sub",
+        version=2,
         data={
-            CONF_USERNAME: TEST_USERNAME,
-            CONF_PASSWORD: TEST_PASSWORD,
             CONF_REGION: TEST_REGION,
-            CONF_BACKEND: "skegox",
+            CONF_REFRESH_TOKEN: TEST_REFRESH_TOKEN,
+            CONF_ID_TOKEN: TEST_ID_TOKEN,
+            # In the future — refresh-on-startup is skipped when not
+            # expiring soon, so the test fixture doesn't have to mock the
+            # network call.
+            CONF_TOKEN_EXPIRY: 9_999_999_999.0,
+            CONF_BACKEND: BACKEND_SKEGOX,
         },
         entry_id=ENTRY_ID,
     )
@@ -207,22 +218,13 @@ async def setup_skegox_integration(hass: HomeAssistant) -> None:
 
     with (
         patch(
-            "homeassistant.components.sharkiq._async_setup_skegox",
-        ) as mock_setup_skegox,
+            "homeassistant.components.sharkiq.SkegoxApi",
+            return_value=mock_api,
+        ),
         patch(
-            "homeassistant.components.sharkiq._async_setup_ayla",
-            return_value=None,
+            "homeassistant.components.sharkiq.SharkAuth.async_refresh_auth",
         ),
     ):
-        devices = await mock_api.async_get_devices()
-        coordinator = SharkIqUpdateCoordinator(
-            hass,
-            entry,
-            shark_vacs=devices,
-            skegox_api=mock_api,
-        )
-        mock_setup_skegox.return_value = coordinator
-
         await hass.config_entries.async_setup(entry.entry_id)
         await hass.async_block_till_done()
 

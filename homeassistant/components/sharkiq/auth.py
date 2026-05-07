@@ -7,8 +7,19 @@ import json
 import secrets
 import time
 from typing import Any, NoReturn
+from urllib.parse import urlparse
 
 import aiohttp
+
+# Mimic the SharkClean Android app's request fingerprint. Auth0's anti-fraud
+# trains on real app traffic — a naked POST with no User-Agent from a server
+# IP scores high enough to trip ``requires_verification``, even on a clean
+# account. Matches the headers the upstream ``sharkiq`` PyPI lib's auth0
+# client uses, which avoids cross-implementation drift.
+_SHARKCLEAN_USER_AGENT = (
+    "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/139.0.0.0 Mobile Safari/537.36"
+)
 
 from .const import (
     AUTH0_CLIENT_ID_EU,
@@ -84,6 +95,10 @@ class SharkAuth:
 
         self._token_url = AUTH0_TOKEN_URL_EU if europe else AUTH0_TOKEN_URL_US
         self._client_id = AUTH0_CLIENT_ID_EU if europe else AUTH0_CLIENT_ID_US
+        # Origin/Referer for the SharkClean-app fingerprint — derived from the
+        # token URL so we don't drift if the host ever changes.
+        parsed = urlparse(self._token_url)
+        self._auth_origin = f"{parsed.scheme}://{parsed.netloc}"
 
         self._id_token: str | None = None
         self._access_token: str | None = None
@@ -157,11 +172,17 @@ class SharkAuth:
 
     async def _async_token_request(self, data: dict[str, str]) -> None:
         """Execute a token request against Auth0."""
+        headers = {
+            "Content-Type": "application/json",
+            "User-Agent": _SHARKCLEAN_USER_AGENT,
+            "Origin": self._auth_origin,
+            "Referer": f"{self._auth_origin}/",
+        }
         try:
             async with self._websession.post(
                 self._token_url,
                 json=data,
-                headers={"content-type": "application/json"},
+                headers=headers,
             ) as resp:
                 if resp.status == 200:
                     result: dict[str, Any] = await resp.json()

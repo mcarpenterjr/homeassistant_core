@@ -118,6 +118,69 @@ async def test_async_sign_in_success_populates_tokens() -> None:
     assert auth.user_id == "123"
 
 
+async def test_async_sign_in_sends_sharkclean_app_fingerprint() -> None:
+    """Token requests carry SharkClean-app-style headers, not naked JSON.
+
+    Auth0's anti-fraud is trained against the real Android app's request
+    fingerprint. A POST that's missing User-Agent / Origin / Referer scores
+    high enough to trip a ``requires_verification`` challenge even on an
+    otherwise-clean account, so we explicitly mimic the app's headers. If
+    this test starts failing it means the fingerprint regressed — Auth0
+    will likely re-flag the account in production until it's restored.
+    """
+    body = json.dumps(
+        {
+            "id_token": "eyJhbGciOi.eyJzdWIiOiJ4In0.sig",
+            "refresh_token": "r",
+            "expires_in": 86400,
+        }
+    )
+    session = _build_session(200, body)
+    auth = SharkAuth(
+        username="u@example.com",
+        password="pw",
+        websession=session,
+        europe=False,
+    )
+
+    await auth.async_sign_in()
+
+    # Inspect what was actually sent to the post call.
+    _args, kwargs = session.post.call_args
+    headers = kwargs["headers"]
+    assert headers["Content-Type"] == "application/json"
+    assert "User-Agent" in headers
+    # Specifically: a mobile-app-shaped UA, not the python aiohttp default.
+    assert "Mobile" in headers["User-Agent"] or "Android" in headers["User-Agent"]
+    # Origin/Referer must point at the Auth0 host the token URL targets, not
+    # be hard-coded — different regions use different hosts.
+    assert headers["Origin"] == "https://login.sharkninja.com"
+    assert headers["Referer"] == "https://login.sharkninja.com/"
+
+
+async def test_async_sign_in_origin_follows_eu_token_url() -> None:
+    """EU accounts hit ``logineu.sharkninja.com``; Origin/Referer must match."""
+    body = json.dumps(
+        {
+            "id_token": "eyJhbGciOi.eyJzdWIiOiJ4In0.sig",
+            "expires_in": 86400,
+        }
+    )
+    session = _build_session(200, body)
+    auth = SharkAuth(
+        username="u@example.com",
+        password="pw",
+        websession=session,
+        europe=True,
+    )
+
+    await auth.async_sign_in()
+
+    _args, kwargs = session.post.call_args
+    headers = kwargs["headers"]
+    assert headers["Origin"] == "https://logineu.sharkninja.com"
+
+
 async def test_async_sign_in_network_error_wrapped() -> None:
     """Transport-layer errors are wrapped as SharkAuthError, not bubbled raw."""
     session = MagicMock(spec=aiohttp.ClientSession)

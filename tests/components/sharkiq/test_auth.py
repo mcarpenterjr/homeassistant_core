@@ -21,6 +21,7 @@ from homeassistant.components.sharkiq.auth import (
     build_authorize_url,
     generate_pkce_pair,
     parse_callback_input,
+    parse_token_blob,
     raise_if_auth0_account_blocked,
 )
 
@@ -165,6 +166,53 @@ def test_parse_callback_input_rejects_codeless_input(text: str) -> None:
     """Inputs with no extractable code must raise so the form can re-prompt."""
     with pytest.raises(ValueError):
         parse_callback_input(text)
+
+
+# ---------------------------------------------------------------------------
+# shark2mqtt token JSON paste
+# ---------------------------------------------------------------------------
+
+
+def test_parse_token_blob_accepts_shark2mqtt_format() -> None:
+    """The fields shark2mqtt persists are exactly what we need to bootstrap."""
+    blob = json.dumps(
+        {
+            "auth0_refresh_token": "rt-from-shark2mqtt",
+            "auth0_id_token": "id-from-shark2mqtt",
+            "auth0_access_token": "at-from-shark2mqtt",
+            "ayla_access_token": "ignored",
+            "saved_at": "2026-05-07T12:00:00+00:00",
+        }
+    )
+    refresh, id_token = parse_token_blob(blob)
+    assert refresh == "rt-from-shark2mqtt"
+    assert id_token == "id-from-shark2mqtt"
+
+
+@pytest.mark.parametrize(
+    "blob",
+    [
+        # Not JSON at all — must not be misclassified as a token blob.
+        "AUTH_CODE_LOOKING_LIKE_A_BARE_CODE",
+        # JSON but missing the refresh field — refusing prevents a config
+        # entry that can't be refreshed past the id_token's lifetime.
+        '{"auth0_id_token": "id-only"}',
+        # JSON but missing the id_token — same reasoning.
+        '{"auth0_refresh_token": "rt-only"}',
+        # JSON but with empty values — same.
+        '{"auth0_refresh_token": "", "auth0_id_token": ""}',
+        # Malformed JSON.
+        '{"auth0_refresh_token": "x"',
+        # Empty.
+        "",
+        # JSON array, not object.
+        "[]",
+    ],
+)
+def test_parse_token_blob_rejects_invalid_paste(blob: str) -> None:
+    """Anything that isn't a usable token JSON must raise so the caller falls back."""
+    with pytest.raises(ValueError):
+        parse_token_blob(blob)
 
 
 # ---------------------------------------------------------------------------

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -218,6 +219,86 @@ async def test_form_token_exchange_failures_show_inline_errors(
 
     assert result3["type"] is FlowResultType.FORM
     assert result3["errors"]["base"] == expected_error
+
+
+async def test_form_accepts_shark2mqtt_token_json(hass: HomeAssistant) -> None:
+    """Pasting shark2mqtt's tokens.json content bootstraps the entry directly.
+
+    Refreshing instead of trusting the paste verbatim validates the refresh
+    token AND yields a real expiry, so users who imported a stale token file
+    get a clear ``invalid_auth`` instead of a half-broken entry that fails
+    the next time the access token expires.
+    """
+    result = await hass.config_entries.flow.async_init(
+        DOMAIN, context={"source": config_entries.SOURCE_USER}
+    )
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"], {CONF_REGION: TEST_REGION}
+    )
+
+    blob = json.dumps(
+        {
+            "auth0_refresh_token": "rt-shark2mqtt",
+            "auth0_id_token": "id-shark2mqtt",
+            "auth0_access_token": "at-shark2mqtt",
+        }
+    )
+
+    async def _stub_refresh(self):
+        # Mimic what async_refresh_auth would set on success.
+        self._refresh_token = "rt-rotated"
+        self._id_token = "id-fresh"
+        self._token_expiry = 1_700_000_000.0
+
+    with (
+        patch.multiple(
+            "homeassistant.components.sharkiq.config_flow.SharkAuth",
+            async_refresh_auth=_stub_refresh,
+            user_id=property(lambda self: "user-sub"),
+            email=property(lambda self: "person@example.com"),
+        ),
+        patch(
+            "homeassistant.components.sharkiq.async_setup_entry",
+            return_value=True,
+        ),
+    ):
+        result3 = await hass.config_entries.flow.async_configure(
+            result["flow_id"], {"redirect": blob}
+        )
+
+    assert result3["type"] is FlowResultType.CREATE_ENTRY
+    assert result3["data"][CONF_REFRESH_TOKEN] == "rt-rotated"
+    assert result3["data"][CONF_ID_TOKEN] == "id-fresh"
+
+
+async def test_form_invalid_shark2mqtt_token_json_surfaces_error(
+    hass: HomeAssistant,
+) -> None:
+    """A token JSON paste with an invalid/expired refresh shows ``invalid_auth``."""
+    result = await hass.config_entries.flow.async_init(
+        DOMAIN, context={"source": config_entries.SOURCE_USER}
+    )
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"], {CONF_REGION: TEST_REGION}
+    )
+
+    blob = json.dumps(
+        {
+            "auth0_refresh_token": "rt-stale",
+            "auth0_id_token": "id-stale",
+        }
+    )
+
+    with patch(
+        "homeassistant.components.sharkiq.config_flow.SharkAuth.async_refresh_auth",
+        side_effect=SharkAuthError("token expired"),
+    ):
+        result3 = await hass.config_entries.flow.async_configure(
+            result["flow_id"], {"redirect": blob}
+        )
+
+    assert result3["type"] is FlowResultType.FORM
+    assert result3["errors"]["base"] == "invalid_auth"
 
 
 async def test_reauth_uses_pkce_flow_and_updates_existing_entry(

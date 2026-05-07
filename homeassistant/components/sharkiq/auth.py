@@ -109,6 +109,36 @@ def build_authorize_url(
     return f"{base}?{urlencode(params)}"
 
 
+def parse_token_blob(text: str) -> tuple[str, str]:
+    """Extract ``(refresh_token, id_token)`` from a shark2mqtt token JSON paste.
+
+    `shark2mqtt <https://github.com/CamSoper/shark2mqtt>`_ runs Chromium in
+    a Docker container to do the PKCE login automatically and persists the
+    resulting tokens to ``shark2mqtt_tokens.json``. Users who'd rather run
+    that one-shot than do the manual paste can hand us the file's contents
+    directly — same end-state tokens.
+
+    Raises ValueError if the input isn't a recognisable token blob; callers
+    fall back to the redirect-URL / bare-code path.
+    """
+    text = text.strip()
+    if not (text.startswith("{") and text.endswith("}")):
+        raise ValueError("not a JSON object")
+    try:
+        data = json.loads(text)
+    except (json.JSONDecodeError, ValueError) as err:
+        raise ValueError("paste looks like JSON but failed to parse") from err
+    if not isinstance(data, dict):
+        raise ValueError("token blob must be a JSON object")
+    refresh = data.get("auth0_refresh_token")
+    id_token = data.get("auth0_id_token")
+    if not isinstance(refresh, str) or not refresh:
+        raise ValueError("missing or empty auth0_refresh_token")
+    if not isinstance(id_token, str) or not id_token:
+        raise ValueError("missing or empty auth0_id_token")
+    return refresh, id_token
+
+
 def parse_callback_input(text: str) -> tuple[str, str | None]:
     """Extract ``(code, state)`` from a pasted redirect URL or bare code.
 

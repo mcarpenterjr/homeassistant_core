@@ -45,6 +45,7 @@ from .auth import (
     build_authorize_url,
     generate_pkce_pair,
     parse_callback_input,
+    parse_token_blob,
 )
 from .const import (
     CLEAN_TYPES,
@@ -139,8 +140,32 @@ class SharkIqConfigFlow(ConfigFlow, domain=DOMAIN):
         )
 
         if user_input is not None:
+            raw = user_input[CONF_REDIRECT_INPUT]
+            # Path A: shark2mqtt token JSON paste. Detected first because a
+            # JSON object can't legally appear in a redirect URL or a bare
+            # authorization code, so the discrimination is unambiguous.
             try:
-                code, state = parse_callback_input(user_input[CONF_REDIRECT_INPUT])
+                refresh_token, id_token = parse_token_blob(raw)
+            except ValueError:
+                pass
+            else:
+                info, exchange_errors = await self._async_finalize_with_tokens(
+                    refresh_token, id_token
+                )
+                if info is not None:
+                    return await self._async_finalize_entry(info)
+                errors.update(exchange_errors)
+                return self.async_show_form(
+                    step_id="authorize",
+                    data_schema=SHARKIQ_REDIRECT_SCHEMA,
+                    description_placeholders={"auth_url": auth_url},
+                    errors=errors,
+                )
+
+            # Path B: redirect URL or bare authorization code from the user's
+            # own browser.
+            try:
+                code, state = parse_callback_input(raw)
             except ValueError:
                 errors["base"] = "invalid_redirect"
             else:
@@ -163,6 +188,53 @@ class SharkIqConfigFlow(ConfigFlow, domain=DOMAIN):
             description_placeholders={"auth_url": auth_url},
             errors=errors,
         )
+
+    async def _async_finalize_with_tokens(
+        self, refresh_token: str, id_token: str
+    ) -> tuple[dict[str, Any] | None, dict[str, str]]:
+        """Validate pre-acquired tokens (e.g. from shark2mqtt) by refreshing.
+
+        Refreshing instead of trusting the paste verbatim does two things at
+        once: it confirms the refresh token actually works against Auth0
+        (so a stale paste fails fast with a clear error), and it gives us
+        a real ``token_expiry`` to persist instead of guessing from the
+        id_token's ``exp`` claim.
+        """
+        websession = async_create_clientsession(
+            self.hass,
+            cookie_jar=aiohttp.CookieJar(unsafe=True, quote_cookie=False),
+            family=socket.AF_INET,
+        )
+        auth = SharkAuth(
+            websession=websession,
+            europe=self._europe,
+            refresh_token=refresh_token,
+            id_token=id_token,
+            token_expiry=0,
+        )
+        try:
+            async with asyncio.timeout(15):
+                await auth.async_refresh_auth()
+        except TimeoutError:
+            return None, {"base": "cannot_connect"}
+        except SharkAuthError as err:
+            LOGGER.error("Imported token refresh failed: %s", err)
+            return None, {"base": "invalid_auth"}
+
+        if not auth.refresh_token or not auth.id_token:
+            return None, {"base": "unknown"}
+
+        info: dict[str, Any] = {
+            "user_id": auth.user_id,
+            "title": auth.email or auth.user_id or "Shark IQ",
+            "data": {
+                CONF_REGION: self._region,
+                CONF_REFRESH_TOKEN: auth.refresh_token,
+                CONF_ID_TOKEN: auth.id_token,
+                CONF_TOKEN_EXPIRY: auth.token_expiry,
+            },
+        }
+        return info, {}
 
     async def _async_exchange_for_tokens(
         self, code: str

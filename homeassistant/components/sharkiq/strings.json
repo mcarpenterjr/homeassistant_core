@@ -26,16 +26,16 @@
       },
       "authorize": {
         "title": "Authorize Home Assistant",
-        "description": "1. Open this URL in a browser on a device where you can sign in to SharkClean:\n\n    {auth_url}\n\n2. Sign in and complete any verification SharkNinja prompts you for.\n3. Your browser will try to open `com.sharkninja.shark://...` and show an error — that's expected. Copy the full URL from the address bar (it contains `?code=...`) and paste it below.",
+        "description": "**Option 1 — Sign in via your browser** (recommended)\n\n1. Open this URL in a browser:\n\n    {auth_url}\n\n2. Sign in to SharkClean and complete any verification SharkNinja prompts you for.\n3. Your browser will try to open `com.sharkninja.shark://...` and show \"site can't be reached\" — that's expected. Copy the full URL from the address bar (it contains `?code=...`) and paste it below.\n\n**Option 2 — Paste shark2mqtt tokens**\n\nIf you've used [shark2mqtt](https://github.com/CamSoper/shark2mqtt) to log in already, paste the contents of `shark2mqtt_tokens.json` instead.",
         "data": {
-          "redirect": "Redirect URL or authorization code"
+          "redirect": "Redirect URL, authorization code, or token JSON"
         }
       },
       "reauth_confirm": {
         "title": "Re-authorize Home Assistant",
-        "description": "1. Open this URL in a browser on a device where you can sign in to SharkClean:\n\n    {auth_url}\n\n2. Sign in and complete any verification SharkNinja prompts you for.\n3. Copy the full URL from the address bar after redirect and paste it below.",
+        "description": "**Option 1 — Sign in via your browser** (recommended)\n\n1. Open this URL in a browser:\n\n    {auth_url}\n\n2. Sign in to SharkClean and complete any verification SharkNinja prompts you for.\n3. Copy the full URL from the address bar after redirect and paste it below.\n\n**Option 2 — Paste shark2mqtt tokens**\n\nPaste the contents of `shark2mqtt_tokens.json` instead.",
         "data": {
-          "redirect": "Redirect URL or authorization code"
+          "redirect": "Redirect URL, authorization code, or token JSON"
         }
       }
     }

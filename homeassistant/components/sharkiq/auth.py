@@ -116,26 +116,29 @@ def parse_callback_input(text: str) -> tuple[str, str | None]:
     user copies the URL bar value (which still contains the query string)
     or just the ``code`` parameter from it. We accept either shape.
 
-    Raises ValueError if no code can be extracted.
+    Raises ValueError if no code can be extracted, including the case of a
+    URL whose query string has no ``code`` parameter (e.g. an
+    ``error=access_denied`` redirect from a cancelled login).
     """
     text = text.strip()
     if not text:
         raise ValueError("empty input")
 
-    # Heuristic: anything starting with a scheme is a URL; otherwise treat
-    # as a bare code. We look for ``code=`` in the middle as well to handle
-    # users who paste just the query string.
-    if "code=" in text:
-        # Even if the URL is malformed (e.g. "?code=abc&state=xyz"), pulling
-        # the query string out keeps us robust to weird browser behavior.
+    # URL-shaped inputs are anything with a ``?`` or a scheme separator.
+    # Branch on shape so we don't mistakenly treat an error-redirect URL
+    # as a bare authorization code (URLs have ``=`` everywhere).
+    if "?" in text or "://" in text:
         query_start = text.find("?")
-        query = text[query_start + 1 :] if query_start >= 0 else text
-        params = parse_qs(query)
+        if query_start < 0:
+            raise ValueError("URL has no query string")
+        params = parse_qs(text[query_start + 1 :])
         codes = params.get("code", [])
-        states = params.get("state", [])
         if not codes:
-            raise ValueError("no code in URL")
+            raise ValueError("URL has no code parameter")
+        states = params.get("state", [])
         return codes[0], states[0] if states else None
+
+    # Otherwise treat as a bare authorization code.
     return text, None
 
 

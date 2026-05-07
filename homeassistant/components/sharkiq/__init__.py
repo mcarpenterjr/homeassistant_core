@@ -42,7 +42,14 @@ from homeassistant.helpers import config_validation as cv, entity_registry as er
 from homeassistant.helpers.aiohttp_client import async_create_clientsession
 from homeassistant.helpers.typing import ConfigType
 
-from .auth import SharkAuth, SharkAuthError
+from .auth import (
+    SharkAuth,
+    SharkAuthError,
+    SharkAuthInvalidCredentialsError,
+    SharkAuthRateLimitedError,
+    SharkAuthVerificationRequiredError,
+    raise_if_auth0_account_blocked,
+)
 from .const import (
     API_TIMEOUT,
     BACKEND_AYLA,
@@ -71,7 +78,8 @@ async def async_connect_or_timeout(ayla_api: AylaApi) -> bool:
         async with asyncio.timeout(API_TIMEOUT):
             LOGGER.debug("Initialize connection to Ayla networks API")
             await ayla_api.async_sign_in()
-    except SharkIqAuthError:
+    except SharkIqAuthError as err:
+        raise_if_auth0_account_blocked(err)
         LOGGER.error("Authentication error connecting to Shark IQ api")
         return False
     except TimeoutError as exc:
@@ -80,6 +88,12 @@ async def async_connect_or_timeout(ayla_api: AylaApi) -> bool:
     except (aiohttp.ClientError, OSError) as exc:
         LOGGER.debug("Network error connecting to Ayla: %s", exc)
         raise CannotConnect from exc
+    except Exception as err:
+        # The pip sharkiq lib lets auth0.exceptions.Auth0Error leak through
+        # unwrapped on its legacy_cookie_sign_in path; classify it here so we
+        # don't end up with "Unexpected exception" for a known failure mode.
+        raise_if_auth0_account_blocked(err)
+        raise
 
     return True
 
@@ -101,6 +115,15 @@ async def _async_setup_skegox(
     try:
         async with asyncio.timeout(API_TIMEOUT):
             await auth.async_sign_in()
+    except (
+        SharkAuthVerificationRequiredError,
+        SharkAuthRateLimitedError,
+        SharkAuthInvalidCredentialsError,
+    ):
+        # Account-level Auth0 failures: don't fall through to Ayla, since
+        # both backends share the same Auth0 tenant. Bubble up to setup_entry
+        # which converts to ConfigEntryAuthFailed / ConfigEntryNotReady.
+        raise
     except (SharkAuthError, TimeoutError) as err:
         LOGGER.debug("Skegox auth failed: %s", err)
         return None
@@ -202,37 +225,49 @@ async def async_setup_entry(
     coordinator: SharkIqUpdateCoordinator | None = None
     stored_backend = config_entry.data.get(CONF_BACKEND)
 
-    # Try backends in order of preference
-    if stored_backend != BACKEND_AYLA:
-        # Try skegox first (newer backend, accounts are being migrated to it)
-        coordinator = await _async_setup_skegox(
-            hass, config_entry, websession, europe
-        )
-        if coordinator:
-            _update_backend(hass, config_entry, BACKEND_SKEGOX)
-
-    if coordinator is None and stored_backend != BACKEND_SKEGOX:
-        # Fall back to Ayla (legacy backend)
-        coordinator = await _async_setup_ayla(
-            hass, config_entry, websession, europe
-        )
-        if coordinator:
-            _update_backend(hass, config_entry, BACKEND_AYLA)
-
-    if coordinator is None:
-        # Try whichever we haven't tried yet
-        if stored_backend == BACKEND_AYLA:
+    try:
+        # Try backends in order of preference
+        if stored_backend != BACKEND_AYLA:
+            # Try skegox first (newer backend, accounts are being migrated to it)
             coordinator = await _async_setup_skegox(
                 hass, config_entry, websession, europe
             )
             if coordinator:
                 _update_backend(hass, config_entry, BACKEND_SKEGOX)
-        elif stored_backend == BACKEND_SKEGOX:
+
+        if coordinator is None and stored_backend != BACKEND_SKEGOX:
+            # Fall back to Ayla (legacy backend)
             coordinator = await _async_setup_ayla(
                 hass, config_entry, websession, europe
             )
             if coordinator:
                 _update_backend(hass, config_entry, BACKEND_AYLA)
+
+        if coordinator is None:
+            # Try whichever we haven't tried yet
+            if stored_backend == BACKEND_AYLA:
+                coordinator = await _async_setup_skegox(
+                    hass, config_entry, websession, europe
+                )
+                if coordinator:
+                    _update_backend(hass, config_entry, BACKEND_SKEGOX)
+            elif stored_backend == BACKEND_SKEGOX:
+                coordinator = await _async_setup_ayla(
+                    hass, config_entry, websession, europe
+                )
+                if coordinator:
+                    _update_backend(hass, config_entry, BACKEND_AYLA)
+    except SharkAuthVerificationRequiredError as err:
+        # Auth0 anti-fraud has flagged the account/IP. The user must clear it
+        # via the SharkClean app on this network — code retries can't help and
+        # only deepen the rate-limit, so flip to reauth and stop hammering.
+        raise exceptions.ConfigEntryAuthFailed(str(err)) from err
+    except SharkAuthRateLimitedError as err:
+        # 429 from Auth0. ConfigEntryNotReady so HA's exponential backoff kicks
+        # in instead of a tight retry loop that would prolong the block.
+        raise exceptions.ConfigEntryNotReady(str(err)) from err
+    except SharkAuthInvalidCredentialsError as err:
+        raise exceptions.ConfigEntryAuthFailed(str(err)) from err
 
     if coordinator is None:
         raise exceptions.ConfigEntryNotReady(

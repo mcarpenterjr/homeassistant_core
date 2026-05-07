@@ -24,7 +24,14 @@ from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers import selector
 from homeassistant.helpers.aiohttp_client import async_create_clientsession
 
-from .auth import SharkAuth, SharkAuthError
+from .auth import (
+    SharkAuth,
+    SharkAuthError,
+    SharkAuthInvalidCredentialsError,
+    SharkAuthRateLimitedError,
+    SharkAuthVerificationRequiredError,
+    raise_if_auth0_account_blocked,
+)
 from .const import (
     CLEAN_TYPES,
     CONF_PRESETS,
@@ -83,6 +90,14 @@ async def _validate_input(
             await auth.async_sign_in()
             LOGGER.debug("Auth0 direct authentication successful")
             return {"title": data[CONF_USERNAME]}
+    except SharkAuthVerificationRequiredError as err:
+        # Both backends share the Auth0 tenant, so falling through to Ayla
+        # would just deepen the rate-limit hole. Surface the actionable error.
+        raise Auth0VerificationRequired(str(err)) from err
+    except SharkAuthRateLimitedError as err:
+        raise Auth0RateLimited(str(err)) from err
+    except SharkAuthInvalidCredentialsError as err:
+        raise InvalidAuth(str(err)) from err
     except SharkAuthError as err:
         LOGGER.debug("Auth0 direct auth failed: %s, trying Ayla fallback", err)
     except TimeoutError:
@@ -106,11 +121,27 @@ async def _validate_input(
             "Unable to connect to SharkIQ services. Check your region settings."
         ) from error
     except SharkIqAuthError as error:
+        # The pip lib's SharkIqAuthError wraps Auth0 anti-fraud signals; check
+        # the message for known patterns before defaulting to invalid_auth.
+        try:
+            raise_if_auth0_account_blocked(error)
+        except SharkAuthVerificationRequiredError as err:
+            raise Auth0VerificationRequired(str(err)) from err
+        except SharkAuthRateLimitedError as err:
+            raise Auth0RateLimited(str(err)) from err
         LOGGER.error(error)
         raise InvalidAuth(
             "Username or password incorrect. Please check your credentials."
         ) from error
     except Exception as error:
+        # The pip lib leaks unwrapped auth0.exceptions.Auth0Error on its
+        # cookie-fallback path; same message-sniffing handles it.
+        try:
+            raise_if_auth0_account_blocked(error)
+        except SharkAuthVerificationRequiredError as err:
+            raise Auth0VerificationRequired(str(err)) from err
+        except SharkAuthRateLimitedError as err:
+            raise Auth0RateLimited(str(err)) from err
         LOGGER.exception("Unexpected exception")
         LOGGER.error(error)
         raise UnknownAuth(
@@ -146,6 +177,10 @@ class SharkIqConfigFlow(ConfigFlow, domain=DOMAIN):
             info = await _validate_input(self.hass, user_input)
         except CannotConnect:
             errors["base"] = "cannot_connect"
+        except Auth0VerificationRequired:
+            errors["base"] = "auth0_verification"
+        except Auth0RateLimited:
+            errors["base"] = "auth0_rate_limited"
         except InvalidAuth:
             errors["base"] = "invalid_auth"
         except UnknownAuth:
@@ -189,7 +224,12 @@ class SharkIqConfigFlow(ConfigFlow, domain=DOMAIN):
                     self.hass.config_entries.async_update_entry(entry, data=user_input)
                     return self.async_abort(reason="reauth_successful")
 
-            if errors["base"] != "invalid_auth":
+            # Stay on the form for retryable errors so the user can fix the
+            # underlying issue (clear the Auth0 verification, fix credentials,
+            # wait out the rate limit) and submit again. Only abort on
+            # terminal failures.
+            retryable = {"invalid_auth", "auth0_verification", "auth0_rate_limited"}
+            if errors["base"] not in retryable:
                 return self.async_abort(reason=errors["base"])
 
         return self.async_show_form(
@@ -209,6 +249,14 @@ class InvalidAuth(HomeAssistantError):
 
 class UnknownAuth(HomeAssistantError):
     """Error to indicate there is an uncaught auth error."""
+
+
+class Auth0VerificationRequired(HomeAssistantError):
+    """Auth0 anti-fraud has flagged this account/IP and requires interactive verification."""
+
+
+class Auth0RateLimited(HomeAssistantError):
+    """Auth0 has temporarily blocked the account after too many failed attempts."""
 
 
 class SharkIqOptionsFlow(OptionsFlowWithReload):

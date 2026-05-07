@@ -6,7 +6,7 @@ import base64
 import json
 import secrets
 import time
-from typing import Any
+from typing import Any, NoReturn
 
 import aiohttp
 
@@ -25,6 +25,44 @@ class SharkAuthError(Exception):
 
 class SharkAuthExpiredError(SharkAuthError):
     """Token has expired."""
+
+
+class SharkAuthVerificationRequiredError(SharkAuthError):
+    """Auth0 anti-fraud has flagged this account/IP and requires interactive verification.
+
+    Cleared by signing into the SharkClean mobile app from the same network as
+    Home Assistant. Also raised by the legacy Ayla path because both backends
+    share the same Auth0 tenant.
+    """
+
+
+class SharkAuthRateLimitedError(SharkAuthError):
+    """Auth0 has temporarily blocked the account after too many failed attempts."""
+
+
+class SharkAuthInvalidCredentialsError(SharkAuthError):
+    """Username or password is incorrect."""
+
+
+def raise_if_auth0_account_blocked(err: BaseException) -> None:
+    """Re-raise as a specific Auth0 account-level error if the message matches.
+
+    Both the skegox path and the legacy Ayla path (the ``sharkiq`` PyPI lib)
+    talk to the same Auth0 tenant, but they wrap failures differently — and
+    the pip lib lets ``auth0.exceptions.Auth0Error`` leak through unwrapped on
+    its cookie fallback. Sniff the message text so all three call sites can
+    route account-level Auth0 failures through the same reauth/backoff logic.
+    No-op if the error doesn't match a known pattern.
+    """
+    msg = str(err).lower()
+    if (
+        "requires_verification" in msg
+        or "requires verification" in msg
+        or "suspicious request" in msg
+    ):
+        raise SharkAuthVerificationRequiredError(str(err)) from err
+    if "too_many_attempts" in msg or "blocked after multiple" in msg:
+        raise SharkAuthRateLimitedError(str(err)) from err
 
 
 class SharkAuth:
@@ -125,18 +163,12 @@ class SharkAuth:
                 json=data,
                 headers={"content-type": "application/json"},
             ) as resp:
-                if resp.status == 403:
-                    body = await resp.text()
-                    LOGGER.error("Auth0 returned 403: %s", body)
-                    raise SharkAuthError(
-                        "Auth0 blocked request (possible anti-bot detection)"
-                    )
-                if resp.status != 200:
+                if resp.status == 200:
+                    result: dict[str, Any] = await resp.json()
+                else:
                     body = await resp.text()
                     LOGGER.error("Auth0 returned %d: %s", resp.status, body)
-                    raise SharkAuthError(f"Auth0 returned status {resp.status}")
-
-                result: dict[str, Any] = await resp.json()
+                    self._raise_for_auth0_error(resp.status, body)
         except aiohttp.ClientError as err:
             raise SharkAuthError(f"Network error during auth: {err}") from err
 
@@ -150,6 +182,46 @@ class SharkAuth:
         expires_in = result.get("expires_in", 86400)
         self._token_expiry = time.time() + expires_in
         LOGGER.debug("Auth0 authentication successful, token expires in %ds", expires_in)
+
+    @staticmethod
+    def _raise_for_auth0_error(status: int, body: str) -> NoReturn:
+        """Translate an Auth0 error response into a specific exception.
+
+        Auth0 encodes failure modes in the response JSON's ``error`` field rather
+        than the HTTP status, so callers can recover differently per cause:
+
+        - ``requires_verification`` (401): account flagged by Auth0 anti-fraud,
+          must be cleared interactively via the SharkClean mobile app
+        - ``too_many_attempts``/429: too many failed logins, wait or unblock
+        - ``invalid_grant``: username/password actually wrong
+        - 403 with no recognised error: anti-bot heuristic on the *request*
+        """
+        err_code = ""
+        try:
+            err_json = json.loads(body)
+        except (json.JSONDecodeError, ValueError):
+            err_json = None
+        if isinstance(err_json, dict):
+            err_code = err_json.get("error", "") or ""
+
+        if err_code == "requires_verification":
+            raise SharkAuthVerificationRequiredError(
+                "Auth0 verification required - sign in via the SharkClean mobile "
+                "app on the same network as Home Assistant to clear the challenge"
+            )
+        if err_code == "too_many_attempts" or status == 429:
+            raise SharkAuthRateLimitedError(
+                "Account temporarily blocked due to too many failed login attempts"
+            )
+        if err_code == "invalid_grant":
+            raise SharkAuthInvalidCredentialsError(
+                "Username or password incorrect"
+            )
+        if status == 403:
+            raise SharkAuthError(
+                "Auth0 blocked request (possible anti-bot detection)"
+            )
+        raise SharkAuthError(f"Auth0 returned status {status}")
 
     def build_signature_header(self, timestamp: str) -> str:
         """Build a fake SN-HMAC-SHA256 signature header.

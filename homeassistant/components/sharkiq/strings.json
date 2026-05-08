@@ -26,14 +26,14 @@
       },
       "authorize": {
         "title": "Authorize Home Assistant",
-        "description": "**Option 1 — Sign in via your browser** (recommended)\n\n1. Open this URL in a browser:\n\n    {auth_url}\n\n2. Sign in to SharkClean and complete any verification SharkNinja prompts you for.\n3. Your browser will try to open `com.sharkninja.shark://...` and show \"site can't be reached\" — that's expected. Copy the full URL from the address bar (it contains `?code=...`) and paste it below.\n\n**Option 2 — Paste shark2mqtt tokens**\n\nIf you've used [shark2mqtt](https://github.com/CamSoper/shark2mqtt) to log in already, paste the contents of `shark2mqtt_tokens.json` instead.",
+        "description": "**Option 1 — Sign in via your browser** (recommended)\n\n1. Open your browser's developer tools (`F12` or `Ctrl+Shift+I` / `Cmd+Opt+I`), switch to the **Network** tab, and enable **Preserve log**. Leave it open for the whole flow.\n2. Open this URL in the same browser tab:\n\n    {auth_url}\n\n3. Sign in to SharkClean and complete any verification SharkNinja prompts you for.\n4. After login, your browser will land on a SharkNinja branding page — that's expected. The real callback is a `com.sharkninja.shark://...` redirect your browser can't follow.\n5. In the Network tab, find the entry whose URL starts with `com.sharkninja.shark://` (it will contain `?code=...&state=...`). Right-click → **Copy** → **Copy link address**, and paste it below.\n\n**Option 2 — Paste shark2mqtt tokens**\n\nIf you've used [shark2mqtt](https://github.com/CamSoper/shark2mqtt) to log in already, paste the contents of `shark2mqtt_tokens.json` instead.",
         "data": {
           "redirect": "Redirect URL, authorization code, or token JSON"
         }
       },
       "reauth_confirm": {
         "title": "Re-authorize Home Assistant",
-        "description": "**Option 1 — Sign in via your browser** (recommended)\n\n1. Open this URL in a browser:\n\n    {auth_url}\n\n2. Sign in to SharkClean and complete any verification SharkNinja prompts you for.\n3. Copy the full URL from the address bar after redirect and paste it below.\n\n**Option 2 — Paste shark2mqtt tokens**\n\nPaste the contents of `shark2mqtt_tokens.json` instead.",
+        "description": "**Option 1 — Sign in via your browser** (recommended)\n\n1. Open your browser's developer tools (`F12` or `Ctrl+Shift+I` / `Cmd+Opt+I`), switch to the **Network** tab, and enable **Preserve log**.\n2. Open this URL in the same browser tab:\n\n    {auth_url}\n\n3. Sign in to SharkClean and complete any verification SharkNinja prompts you for.\n4. After login you'll land on a SharkNinja branding page — that's expected. In the Network tab, find the entry whose URL starts with `com.sharkninja.shark://` and contains `?code=...&state=...`. Right-click → **Copy** → **Copy link address**, and paste it below.\n\n**Option 2 — Paste shark2mqtt tokens**\n\nPaste the contents of `shark2mqtt_tokens.json` instead.",
         "data": {
           "redirect": "Redirect URL, authorization code, or token JSON"
         }

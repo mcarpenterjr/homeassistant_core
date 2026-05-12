@@ -68,7 +68,7 @@ class SharkAuthRateLimitedError(SharkAuthError):
 
 
 class SharkAuthInvalidCredentialsError(SharkAuthError):
-    """Username or password is incorrect."""
+    """Auth0 rejected the grant (stale refresh token or invalid PKCE code)."""
 
 
 def generate_pkce_pair() -> tuple[str, str]:
@@ -369,7 +369,7 @@ class SharkAuth:
         - ``requires_verification`` (401): account flagged by Auth0 anti-fraud,
           must be cleared interactively via the SharkClean mobile app
         - ``too_many_attempts``/429: too many failed logins, wait or unblock
-        - ``invalid_grant``: username/password actually wrong
+        - ``invalid_grant``: refresh token stale, or PKCE code already used
         - 403 with no recognised error: anti-bot heuristic on the *request*
         """
         err_code = ""
@@ -391,7 +391,8 @@ class SharkAuth:
             )
         if err_code == "invalid_grant":
             raise SharkAuthInvalidCredentialsError(
-                "Username or password incorrect"
+                "Auth0 rejected the grant (stale refresh token or invalid "
+                "authorization code) - reauthenticate via the integration"
             )
         if status == 403:
             raise SharkAuthError(

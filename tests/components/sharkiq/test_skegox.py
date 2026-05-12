@@ -388,13 +388,11 @@ async def test_skegox_load_mard_fetch_failure_falls_back() -> None:
         {"floor_id": "X", "areas": "not a list"},
         {"floor_id": "X", "areas": []},
         {"floor_id": "X", "areas": [{"missing": "fields"}]},
-        # Mixed valid/invalid entries: invalid ones are skipped silently.
+        # Robot name empty means we genuinely have nothing to anchor the
+        # dropdown label to; that entry is skipped.
         {
             "floor_id": "X",
-            "areas": [
-                {"user_room_name": "", "robot_room_name": "AZ_1"},
-                {"user_room_name": "Real", "robot_room_name": ""},
-            ],
+            "areas": [{"user_room_name": "Real", "robot_room_name": ""}],
         },
     ],
 )
@@ -407,6 +405,40 @@ async def test_skegox_load_mard_malformed_body_leaves_display_rooms_unset(
     await device.async_load_mard()
 
     assert device.display_rooms is None
+
+
+async def test_skegox_load_mard_uses_robot_room_name_when_user_name_empty() -> (
+    None
+):
+    """SharkClean only fills ``user_room_name`` when the user has renamed a
+    room — auto-assigned rooms ship with that field empty and the display
+    label sitting in ``robot_room_name``. Real bodies observed in the wild
+    are mostly this shape; if we strictly require ``user_room_name`` the
+    HA dropdown shows just the single renamed room.
+    """
+    device = _make_device_with_mard_fetcher(
+        {
+            "floor_id": "FLOOR_1",
+            "areas": [
+                # User-renamed: takes user_room_name.
+                {
+                    "robot_room_name": "AZ_1",
+                    "user_room_name": "Laundry Room",
+                },
+                # Auto-assigned: empty user_room_name, falls back to robot name.
+                {"robot_room_name": "Bedroom", "user_room_name": ""},
+                {"robot_room_name": "Foyer"},  # field missing entirely
+            ],
+        }
+    )
+
+    await device.async_load_mard()
+
+    assert device.display_rooms == {
+        "Laundry Room": ["AZ_1"],
+        "Bedroom": ["Bedroom"],
+        "Foyer": ["Foyer"],
+    }
 
 
 def test_skegox_expand_display_rooms_passthrough_without_mard() -> None:

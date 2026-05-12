@@ -579,18 +579,28 @@ class SkegoxDevice:
             LOGGER.debug("MARD 'areas' is not a list for %s", self._snd)
             return
 
-        # Group by user_room_name to collapse merged areas. Preserve insertion
-        # order so the dropdown matches the order the user sees in the app.
+        # Group areas by display name to collapse merged areas. The display
+        # name is ``user_room_name`` *when populated*; SharkClean leaves it
+        # empty on auto-assigned rooms and only fills it when the user
+        # renames one. Fall back to ``robot_room_name`` (which carries the
+        # device's auto-generated label like "Bedroom" or "Foyer") so the
+        # dropdown shows the same labels as the app.
+        #
+        # Preserve insertion order so the dropdown matches the order the
+        # user sees in the app.
         mapping: dict[str, list[str]] = {}
         for area in areas:
             if not isinstance(area, dict):
                 continue
-            display = area.get("user_room_name")
+            user_name = area.get("user_room_name")
             robot = area.get("robot_room_name")
-            if not isinstance(display, str) or not display:
-                continue
             if not isinstance(robot, str) or not robot:
                 continue
+            display = (
+                user_name
+                if isinstance(user_name, str) and user_name
+                else robot
+            )
             mapping.setdefault(display, []).append(robot)
 
         self._display_rooms = mapping or None

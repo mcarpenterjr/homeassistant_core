@@ -127,6 +127,16 @@ def render_floor_plan_svg(
     if title:
         parts.append(f'<title>{_xml_escape(title)}</title>')
 
+    # Mirror across the viewBox's vertical centre line so the layout
+    # matches the SharkClean app's orientation. MARD's coordinate system
+    # is the robot's left-handed frame; flipping X swaps it into the
+    # screen's right-handed frame. We flip the polygon layer with an SVG
+    # transform and flip each label's X individually so text still reads
+    # left-to-right.
+    flip_axis_x = min_x + max_x
+    parts.append(
+        f'<g transform="matrix(-1 0 0 1 {flip_axis_x:.3f} 0)">'
+    )
     for area in area_list:
         color = _color_for(area.get("uuid") or area["display_name"])
         pts = " ".join(f"{x:.3f},{y:.3f}" for x, y in area["points"])
@@ -134,9 +144,13 @@ def render_floor_plan_svg(
             f'<polygon class="room" points="{pts}" '
             f'fill="{color}" stroke="{color}" stroke-width="{stroke_width:.3f}"/>'
         )
+    parts.append("</g>")
+
+    for area in area_list:
         cx, cy = _centroid(area["points"])
+        flipped_cx = flip_axis_x - cx
         parts.append(
-            f'<text class="label" x="{cx:.3f}" y="{cy:.3f}" '
+            f'<text class="label" x="{flipped_cx:.3f}" y="{cy:.3f}" '
             f'font-size="{font_size:.2f}">{_xml_escape(area["display_name"])}</text>'
         )
 

@@ -476,6 +476,53 @@ def test_skegox_expand_display_rooms_resolves_merges_and_dedupes() -> None:
     ]
 
 
+async def test_skegox_load_mard_caches_polygon_geometry() -> None:
+    """``mard_areas`` is populated with per-area geometry the renderer needs.
+
+    Coordinates from MARD are floats; the renderer needs ``(float, float)``
+    tuples and at least three points per polygon. Degenerate areas (fewer
+    than 3 points) are dropped so the image entity never has to defend
+    against them.
+    """
+    device = _make_device_with_mard_fetcher(
+        {
+            "floor_id": "F1",
+            "areas": [
+                {
+                    "robot_room_name": "Kitchen",
+                    "user_room_name": "",
+                    "uuid": "u-kitchen",
+                    "points": [
+                        {"x": 0, "y": 0},
+                        {"x": 10, "y": 0},
+                        {"x": 10, "y": 10},
+                        {"x": 0, "y": 10},
+                    ],
+                },
+                {
+                    "robot_room_name": "Foyer",
+                    "user_room_name": "",
+                    "uuid": "u-foyer",
+                    "points": [{"x": 1, "y": 1}],  # too few points, dropped
+                },
+            ],
+        }
+    )
+
+    await device.async_load_mard()
+
+    assert device.mard_areas is not None
+    assert [a["display_name"] for a in device.mard_areas] == ["Kitchen"]
+    kitchen = device.mard_areas[0]
+    assert kitchen["uuid"] == "u-kitchen"
+    assert kitchen["points"] == [
+        (0.0, 0.0),
+        (10.0, 0.0),
+        (10.0, 10.0),
+        (0.0, 10.0),
+    ]
+
+
 async def test_skegox_clean_rooms_uses_mard_floor_id_and_expansion() -> None:
     """Clean payload uses the MARD floor_id and expands merged display rooms."""
     device = SkegoxDevice(MockSkegoxApi(), "household", deepcopy(SKEGOX_DEVICE_DATA))

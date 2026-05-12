@@ -364,6 +364,10 @@ class SkegoxDevice:
         # the shadow's list when ``display_rooms`` is None.
         self._display_rooms: dict[str, list[str]] | None = None
         self._mard_floor_id: str | None = None
+        # Per-area dicts (display_name, points, uuid) for the floor-plan
+        # image entity. None means MARD hasn't been parsed or had no usable
+        # geometry — the image entity returns ``None`` in that case.
+        self._mard_areas: list[dict[str, Any]] | None = None
 
     def _parse_shadow(self, device_data: dict[str, Any]) -> None:
         """Parse shadow properties from device data.
@@ -541,6 +545,16 @@ class SkegoxDevice:
         """
         return self._display_rooms
 
+    @property
+    def mard_areas(self) -> list[dict[str, Any]] | None:
+        """Per-area geometry parsed from MARD.
+
+        Each entry is ``{"display_name": str, "points": list[tuple[float, float]],
+        "uuid": str}``. ``None`` until MARD has been parsed, or if MARD had
+        no usable polygons. Consumed by the floor-plan image entity.
+        """
+        return self._mard_areas
+
     async def async_load_mard(self) -> None:
         """Fetch + parse this device's MARD file.
 
@@ -586,9 +600,14 @@ class SkegoxDevice:
         # device's auto-generated label like "Bedroom" or "Foyer") so the
         # dropdown shows the same labels as the app.
         #
+        # In the same pass, extract each area's polygon for the floor-plan
+        # image entity. Keeping both walks of the data in one place avoids
+        # them drifting out of sync if the MARD shape evolves.
+        #
         # Preserve insertion order so the dropdown matches the order the
         # user sees in the app.
         mapping: dict[str, list[str]] = {}
+        geometry: list[dict[str, Any]] = []
         for area in areas:
             if not isinstance(area, dict):
                 continue
@@ -603,13 +622,34 @@ class SkegoxDevice:
             )
             mapping.setdefault(display, []).append(robot)
 
+            raw_points = area.get("points")
+            if isinstance(raw_points, list):
+                points = [
+                    (float(p["x"]), float(p["y"]))
+                    for p in raw_points
+                    if isinstance(p, dict)
+                    and isinstance(p.get("x"), (int, float))
+                    and isinstance(p.get("y"), (int, float))
+                ]
+                if len(points) >= 3:
+                    uuid = area.get("uuid")
+                    geometry.append(
+                        {
+                            "display_name": display,
+                            "points": points,
+                            "uuid": uuid if isinstance(uuid, str) else "",
+                        }
+                    )
+
         self._display_rooms = mapping or None
+        self._mard_areas = geometry or None
         if mapping:
             LOGGER.debug(
-                "MARD: built %d display room(s) for %s; merges: %s",
+                "MARD: built %d display room(s) for %s; merges: %s; polygons: %d",
                 len(mapping),
                 self._snd,
                 {k: v for k, v in mapping.items() if len(v) > 1},
+                len(geometry),
             )
 
     async def async_clean_rooms(

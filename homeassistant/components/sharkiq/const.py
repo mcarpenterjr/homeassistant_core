@@ -8,7 +8,7 @@ from homeassistant.const import Platform
 LOGGER = logging.getLogger(__package__)
 
 API_TIMEOUT = 20
-PLATFORMS = [Platform.BUTTON, Platform.VACUUM]
+PLATFORMS = [Platform.BUTTON, Platform.IMAGE, Platform.VACUUM]
 DOMAIN = "sharkiq"
 SHARK = "Shark"
 # Default poll cadence used while the vacuum is actively cleaning or returning.

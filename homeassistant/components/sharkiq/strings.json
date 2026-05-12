@@ -95,6 +95,13 @@
       "message": "Fan speed {fan_speed} is not supported. Use one of: Eco, Normal, Max."
     }
   },
+  "entity": {
+    "image": {
+      "floor_plan": {
+        "name": "Floor plan"
+      }
+    }
+  },
   "selector": {
     "region": {
       "options": {

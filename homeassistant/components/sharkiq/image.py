@@ -91,13 +91,26 @@ class SharkIqFloorPlanImage(
             (a.get("display_name", ""), a.get("uuid", "")) for a in areas
         )
 
+    def _refresh_if_areas_changed(self) -> bool:
+        """Bump ``image_last_updated`` when the MARD signature changed.
+
+        Split out from :meth:`_handle_coordinator_update` so the change-
+        detection logic can be unit-tested without needing a full HA state-
+        machine setup (which ``async_write_ha_state`` requires). Returns
+        ``True`` when a bump happened — useful for tests, ignored at
+        runtime.
+        """
+        new_sig = self._signature()
+        if new_sig == self._areas_signature:
+            return False
+        self._areas_signature = new_sig
+        self._attr_image_last_updated = dt_util.utcnow()
+        self._cached_image = None
+        return True
+
     def _handle_coordinator_update(self) -> None:
         """Refresh the cache timestamp only when the MARD areas changed."""
-        new_sig = self._signature()
-        if new_sig != self._areas_signature:
-            self._areas_signature = new_sig
-            self._attr_image_last_updated = dt_util.utcnow()
-            self._cached_image = None
+        self._refresh_if_areas_changed()
         super()._handle_coordinator_update()
 
     def image(self) -> bytes | None:

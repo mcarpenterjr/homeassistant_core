@@ -83,10 +83,17 @@ def test_floor_plan_image_signature_picks_up_renames(hass: HomeAssistant) -> Non
             "points": [(0.0, 0.0), (1.0, 0.0), (1.0, 1.0)],
         }
     ]
-    entity._handle_coordinator_update()
+    # Use the change-detection helper directly so the test doesn't need a
+    # fully wired HA state machine (which the public coordinator update
+    # callback requires via ``async_write_ha_state``).
+    assert entity._refresh_if_areas_changed() is True
 
     assert entity.image_last_updated is not None
     assert entity.image_last_updated != first_ts
+    # A second call with no further changes does NOT bump the timestamp.
+    second_ts = entity.image_last_updated
+    assert entity._refresh_if_areas_changed() is False
+    assert entity.image_last_updated == second_ts
 
 
 class _DummyCoordinator:

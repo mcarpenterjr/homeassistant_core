@@ -192,6 +192,15 @@ class SkegoxApi:
             device = SkegoxDevice(self, household_id, device_data)
             devices.append(device)
 
+        # Load MARD per device so the room dropdown and clean_room expansion
+        # have the SharkClean app's display names ready by the time the
+        # platforms are set up. MARD load is best-effort and never blocks.
+        if devices:
+            await asyncio.gather(
+                *(device.async_load_mard() for device in devices),
+                return_exceptions=True,
+            )
+
         LOGGER.debug("Found %d skegox device(s)", len(devices))
         return devices
 
@@ -254,6 +263,53 @@ class SkegoxApi:
             },
         )
 
+    async def async_fetch_property_file(
+        self, household_id: str, device_snd: str, property_name: str
+    ) -> Any:
+        """Fetch a property-file blob (e.g. MARD) for a device.
+
+        The skegox property-files endpoint returns a wrapper containing
+        presigned S3 URLs; the body itself lives on AWS. The presigned URL
+        is anonymous — sending our auth headers would actually break the
+        signature check, so the S3 fetch goes through the raw websession.
+
+        Returns the parsed JSON body, or raises :class:`SkegoxApiError` on
+        any HTTP, network, or parse failure so callers can decide whether
+        to degrade.
+        """
+        wrapper = await self._async_request(
+            "GET",
+            f"/devicesEndUserController/{household_id}/devices/{device_snd}/property-files",
+            params={"properties": property_name},
+        )
+        files = wrapper.get("files") or []
+        if not files:
+            raise SkegoxApiError(
+                f"No property-file entries for {property_name}"
+            )
+        url = files[0].get("presignedUrl")
+        if not url:
+            raise SkegoxApiError(
+                f"property-file response for {property_name} has no presignedUrl"
+            )
+        try:
+            async with self._websession.get(url) as resp:
+                if resp.status >= 400:
+                    body = await resp.text()
+                    raise SkegoxApiError(
+                        f"property-file S3 fetch returned {resp.status}: {body}"
+                    )
+                # S3 doesn't always set application/json; force-parse.
+                text = await resp.text()
+        except aiohttp.ClientError as err:
+            raise SkegoxApiError(f"property-file S3 fetch failed: {err}") from err
+        try:
+            return json.loads(text)
+        except (json.JSONDecodeError, ValueError) as err:
+            raise SkegoxApiError(
+                f"property-file body is not valid JSON: {err}"
+            ) from err
+
 
 class SkegoxDevice:
     """Device wrapper for skegox backend, compatible with SharkIqVacuum interface."""
@@ -299,6 +355,15 @@ class SkegoxDevice:
         # Build properties dict from shadow data
         self.properties_full: dict[str, dict[str, Any]] = {}
         self._parse_shadow(device_data)
+
+        # MARD-derived state. The shadow's ``Robot_Room_List`` only carries
+        # robot-side names ("AZ_1", "AZ_2"…); the SharkClean app's display
+        # names live in the MARD file, and **merged areas share one display
+        # name across multiple robot names**. We populate this lazily so a
+        # MARD-fetch failure doesn't block setup, and consumers fall back to
+        # the shadow's list when ``display_rooms`` is None.
+        self._display_rooms: dict[str, list[str]] | None = None
+        self._mard_floor_id: str | None = None
 
     def _parse_shadow(self, device_data: dict[str, Any]) -> None:
         """Parse shadow properties from device data.
@@ -445,10 +510,108 @@ class SkegoxDevice:
         """Trigger the find device chirp."""
         await self.async_set_property_value("Find_Device", 1)
 
+    def _expand_display_rooms(self, rooms: list[str]) -> list[str]:
+        """Translate display names → robot_room_names; pass-through unknowns.
+
+        Idempotent: if the caller already provides robot names, or if no
+        MARD mapping is loaded, the input is returned unchanged. Order is
+        preserved and duplicates collapsed so the device payload is
+        deterministic.
+        """
+        mapping = self._display_rooms
+        if not mapping:
+            return list(rooms)
+        expanded: list[str] = []
+        seen: set[str] = set()
+        for name in rooms:
+            targets = mapping.get(name, [name])
+            for target in targets:
+                if target not in seen:
+                    seen.add(target)
+                    expanded.append(target)
+        return expanded
+
+    @property
+    def display_rooms(self) -> dict[str, list[str]] | None:
+        """Map display room name → list of robot_room_names that compose it.
+
+        Populated by :meth:`async_load_mard` from the MARD file. ``None``
+        when MARD hasn't been loaded or the device doesn't expose one;
+        callers should fall back to the shadow's ``Robot_Room_List``.
+        """
+        return self._display_rooms
+
+    async def async_load_mard(self) -> None:
+        """Fetch + parse this device's MARD file.
+
+        The MARD JSON has the SharkClean app's room labels, including the
+        crucial property that **merged areas share one ``user_room_name``
+        across multiple ``robot_room_name`` entries** — without it, HA can
+        only show the raw ``AZ_N`` names and can't represent merges.
+
+        Best-effort: failure here is logged at debug and leaves
+        ``display_rooms`` unset. The shadow-based room list still works.
+        """
+        try:
+            body = await self._api.async_fetch_property_file(
+                self._household_id, self._snd, "MARD"
+            )
+        except SkegoxApiError as err:
+            LOGGER.debug(
+                "MARD fetch for %s failed (will fall back to shadow rooms): %s",
+                self._snd,
+                err,
+            )
+            return
+
+        # Raw dump at DEBUG so users can hand us a sample for area-coordinate
+        # schema reverse-engineering. Compact (no indent) to keep one event
+        # per device on one log line.
+        LOGGER.debug("MARD body for %s: %s", self._snd, json.dumps(body))
+
+        if not isinstance(body, dict):
+            LOGGER.debug("MARD body for %s is not a JSON object", self._snd)
+            return
+
+        self._mard_floor_id = body.get("floor_id")
+        areas = body.get("areas") or []
+        if not isinstance(areas, list):
+            LOGGER.debug("MARD 'areas' is not a list for %s", self._snd)
+            return
+
+        # Group by user_room_name to collapse merged areas. Preserve insertion
+        # order so the dropdown matches the order the user sees in the app.
+        mapping: dict[str, list[str]] = {}
+        for area in areas:
+            if not isinstance(area, dict):
+                continue
+            display = area.get("user_room_name")
+            robot = area.get("robot_room_name")
+            if not isinstance(display, str) or not display:
+                continue
+            if not isinstance(robot, str) or not robot:
+                continue
+            mapping.setdefault(display, []).append(robot)
+
+        self._display_rooms = mapping or None
+        if mapping:
+            LOGGER.debug(
+                "MARD: built %d display room(s) for %s; merges: %s",
+                len(mapping),
+                self._snd,
+                {k: v for k, v in mapping.items() if len(v) > 1},
+            )
+
     async def async_clean_rooms(
         self, rooms: list[str], clean_type: str = "dry"
     ) -> None:
         """Clean specific rooms.
+
+        Accepts either MARD ``user_room_name`` display values (the names
+        shown in the SharkClean app, post-merge) or raw shadow room names.
+        When a display name corresponds to multiple ``robot_room_name``
+        entries (merged areas), all underlying names are expanded into the
+        payload so the robot cleans the full merged area.
 
         Different device generations use different shadow keys:
         - ``AreasToClean_V3``: object form ``{"UserRoom": [...]}``
@@ -459,9 +622,10 @@ class SkegoxDevice:
         carries it in the shadow) and is otherwise informational. Valid
         values observed in the wild: ``"dry"``, ``"wet"``.
         """
+        rooms = self._expand_display_rooms(rooms)
         room_list = self.get_property_value("Robot_Room_List")
-        floor_id = ""
-        if room_list and ":" in room_list:
+        floor_id = self._mard_floor_id or ""
+        if not floor_id and room_list and ":" in room_list:
             floor_id = room_list.split(":")[0]
 
         if "AreasToClean_V3" in self.properties_full:

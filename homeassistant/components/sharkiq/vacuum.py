@@ -299,7 +299,17 @@ class SharkVacuumEntity(CoordinatorEntity[SharkIqUpdateCoordinator], StateVacuum
 
     @property
     def available_rooms(self) -> list | None:
-        """Return a list of rooms available to clean."""
+        """Return a list of rooms available to clean.
+
+        Skegox devices with a parsed MARD expose ``display_rooms`` whose keys
+        are the SharkClean app's ``user_room_name`` values (post-merge,
+        post-rename). Those are what the user expects to see; only fall back
+        to the shadow's ``Robot_Room_List`` when the MARD path isn't
+        available (legacy Ayla, or MARD load failed at setup).
+        """
+        display_rooms = getattr(self.sharkiq, "display_rooms", None)
+        if display_rooms:
+            return list(display_rooms.keys())
         room_list = self.sharkiq.get_property_value(Properties.ROBOT_ROOM_LIST)
         if room_list:
             return room_list.split(":")[1:]

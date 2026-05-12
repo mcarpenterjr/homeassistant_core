@@ -298,3 +298,175 @@ async def test_skegox_error_text() -> None:
     # Test unknown error
     device.properties_full["Error_Code"]["value"] = 999
     assert device.error_text == "Unknown error (999)"
+
+
+def _make_device_with_mard_fetcher(mard_body: Any) -> SkegoxDevice:
+    """Build a SkegoxDevice whose API's ``fetch_property_file`` returns the given body."""
+    mock_api = MockSkegoxApi()
+
+    async def _fake_fetch(
+        household_id: str, device_snd: str, property_name: str
+    ) -> Any:
+        assert property_name == "MARD"
+        return mard_body
+
+    mock_api.async_fetch_property_file = _fake_fetch  # type: ignore[method-assign]
+    return SkegoxDevice(mock_api, "household", deepcopy(SKEGOX_DEVICE_DATA))
+
+
+async def test_skegox_load_mard_builds_display_rooms() -> None:
+    """Happy path: MARD with simple distinct rooms populates display_rooms."""
+    device = _make_device_with_mard_fetcher(
+        {
+            "floor_id": "FLOOR_1",
+            "areas": [
+                {"user_room_name": "Kitchen", "robot_room_name": "AZ_1"},
+                {"user_room_name": "Living Room", "robot_room_name": "AZ_2"},
+            ],
+        }
+    )
+
+    await device.async_load_mard()
+
+    assert device.display_rooms == {
+        "Kitchen": ["AZ_1"],
+        "Living Room": ["AZ_2"],
+    }
+
+
+async def test_skegox_load_mard_merges_shared_user_room_names() -> None:
+    """Merged areas share one ``user_room_name`` mapped to all robot names.
+
+    This is the bug behind "rooms in HA don't match the app" — the SharkClean
+    app collapses merged areas into a single tile labelled with the user-typed
+    name, while the shadow's ``Robot_Room_List`` keeps the underlying
+    ``AZ_N`` rows. MARD is what makes the two views agree.
+    """
+    device = _make_device_with_mard_fetcher(
+        {
+            "floor_id": "FLOOR_1",
+            "areas": [
+                {"user_room_name": "Kitchen", "robot_room_name": "AZ_3"},
+                {"user_room_name": "Kitchen", "robot_room_name": "AZ_4"},
+                {"user_room_name": "Hallway", "robot_room_name": "AZ_5"},
+            ],
+        }
+    )
+
+    await device.async_load_mard()
+
+    assert device.display_rooms == {
+        "Kitchen": ["AZ_3", "AZ_4"],
+        "Hallway": ["AZ_5"],
+    }
+
+
+async def test_skegox_load_mard_fetch_failure_falls_back() -> None:
+    """A failed MARD fetch leaves display_rooms unset so callers fall back."""
+    mock_api = MockSkegoxApi()
+
+    async def _failing_fetch(
+        household_id: str, device_snd: str, property_name: str
+    ) -> Any:
+        from homeassistant.components.sharkiq.skegox import SkegoxApiError
+
+        raise SkegoxApiError("no MARD here")
+
+    mock_api.async_fetch_property_file = _failing_fetch  # type: ignore[method-assign]
+    device = SkegoxDevice(mock_api, "household", deepcopy(SKEGOX_DEVICE_DATA))
+
+    await device.async_load_mard()
+
+    assert device.display_rooms is None
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        "not a dict",
+        {"floor_id": "X"},  # no areas key
+        {"floor_id": "X", "areas": "not a list"},
+        {"floor_id": "X", "areas": []},
+        {"floor_id": "X", "areas": [{"missing": "fields"}]},
+        # Mixed valid/invalid entries: invalid ones are skipped silently.
+        {
+            "floor_id": "X",
+            "areas": [
+                {"user_room_name": "", "robot_room_name": "AZ_1"},
+                {"user_room_name": "Real", "robot_room_name": ""},
+            ],
+        },
+    ],
+)
+async def test_skegox_load_mard_malformed_body_leaves_display_rooms_unset(
+    body: Any,
+) -> None:
+    """Defensive: surprising MARD shapes never blow up setup."""
+    device = _make_device_with_mard_fetcher(body)
+
+    await device.async_load_mard()
+
+    assert device.display_rooms is None
+
+
+def test_skegox_expand_display_rooms_passthrough_without_mard() -> None:
+    """Without a MARD mapping, the room list is returned unchanged."""
+    device = SkegoxDevice(MockSkegoxApi(), "household", deepcopy(SKEGOX_DEVICE_DATA))
+
+    assert device._expand_display_rooms(["Kitchen", "Foyer"]) == ["Kitchen", "Foyer"]
+
+
+def test_skegox_expand_display_rooms_resolves_merges_and_dedupes() -> None:
+    """Display names expand; unknowns pass through; duplicates collapse.
+
+    Passing both a display name and one of its underlying robot names would
+    naively send the same robot name twice — that's a payload that fails on
+    some firmware revisions, so the expander deduplicates.
+    """
+    device = SkegoxDevice(MockSkegoxApi(), "household", deepcopy(SKEGOX_DEVICE_DATA))
+    device._display_rooms = {
+        "Kitchen": ["AZ_3", "AZ_4"],
+        "Foyer": ["AZ_5"],
+    }
+
+    assert device._expand_display_rooms(["Kitchen"]) == ["AZ_3", "AZ_4"]
+    assert device._expand_display_rooms(["Kitchen", "Foyer"]) == [
+        "AZ_3",
+        "AZ_4",
+        "AZ_5",
+    ]
+    # Unknown display name (e.g. user passed a raw robot name): pass-through.
+    assert device._expand_display_rooms(["AZ_9"]) == ["AZ_9"]
+    # Display name + one of its underlying names: deduped.
+    assert device._expand_display_rooms(["Kitchen", "AZ_3"]) == [
+        "AZ_3",
+        "AZ_4",
+    ]
+
+
+async def test_skegox_clean_rooms_uses_mard_floor_id_and_expansion() -> None:
+    """Clean payload uses the MARD floor_id and expands merged display rooms."""
+    device = SkegoxDevice(MockSkegoxApi(), "household", deepcopy(SKEGOX_DEVICE_DATA))
+    device._display_rooms = {"Kitchen": ["AZ_3", "AZ_4"]}
+    device._mard_floor_id = "FLOOR_MARD"
+    # Force V3 payload path — newer devices use it exclusively.
+    device.properties_full["AreasToClean_V3"] = {
+        "value": "",
+        "read_only": False,
+        "base_type": "str",
+    }
+
+    captured: dict[str, Any] = {}
+
+    async def _capture(property_name: Any, value: Any) -> None:
+        captured.setdefault(property_name, value)
+
+    device.async_set_property_value = _capture  # type: ignore[method-assign]
+
+    await device.async_clean_rooms(["Kitchen"])
+
+    import json as _json
+
+    payload = _json.loads(captured["AreasToClean_V3"])
+    assert payload["floor_id"] == "FLOOR_MARD"
+    assert payload["areas_to_clean"] == {"UserRoom": ["AZ_3", "AZ_4"]}

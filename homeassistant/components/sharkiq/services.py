@@ -67,6 +67,15 @@ def async_refresh_clean_room_schema(hass: HomeAssistant) -> None:
 
     for coordinator in _all_loaded_coordinators(hass):
         for vac in coordinator.shark_vacs.values():
+            # MARD-derived display names (post-merge, app-accurate) are
+            # preferred when available; only fall back to the shadow's
+            # ``Robot_Room_List`` (raw ``AZ_N``-style names) when MARD
+            # didn't load — typically the legacy Ayla path or a device that
+            # hasn't published a MARD yet.
+            display_rooms = getattr(vac, "display_rooms", None)
+            if display_rooms:
+                rooms.update(display_rooms.keys())
+                continue
             try:
                 room_list = vac.get_property_value("Robot_Room_List")
             except KeyError:

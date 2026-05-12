@@ -127,15 +127,15 @@ def render_floor_plan_svg(
     if title:
         parts.append(f'<title>{_xml_escape(title)}</title>')
 
-    # Mirror across the viewBox's vertical centre line so the layout
-    # matches the SharkClean app's orientation. MARD's coordinate system
-    # is the robot's left-handed frame; flipping X swaps it into the
-    # screen's right-handed frame. We flip the polygon layer with an SVG
-    # transform and flip each label's X individually so text still reads
-    # left-to-right.
+    # MARD's coordinate frame doesn't line up with screen space — relative
+    # to the SharkClean app, the raw render comes out mirrored on both
+    # axes. Apply a 180° flip (X *and* Y) so the layout matches the app,
+    # with labels positioned in the un-flipped frame so text still reads
+    # left-to-right and right-side-up.
     flip_axis_x = min_x + max_x
+    flip_axis_y = min_y + max_y
     parts.append(
-        f'<g transform="matrix(-1 0 0 1 {flip_axis_x:.3f} 0)">'
+        f'<g transform="matrix(-1 0 0 -1 {flip_axis_x:.3f} {flip_axis_y:.3f})">'
     )
     for area in area_list:
         color = _color_for(area.get("uuid") or area["display_name"])
@@ -149,8 +149,9 @@ def render_floor_plan_svg(
     for area in area_list:
         cx, cy = _centroid(area["points"])
         flipped_cx = flip_axis_x - cx
+        flipped_cy = flip_axis_y - cy
         parts.append(
-            f'<text class="label" x="{flipped_cx:.3f}" y="{cy:.3f}" '
+            f'<text class="label" x="{flipped_cx:.3f}" y="{flipped_cy:.3f}" '
             f'font-size="{font_size:.2f}">{_xml_escape(area["display_name"])}</text>'
         )
 

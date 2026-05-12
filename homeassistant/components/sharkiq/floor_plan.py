@@ -83,7 +83,10 @@ def render_floor_plan_svg(
     needed; if a particular device disagrees, surface that as a config
     option rather than hard-coding a flip here.
     """
-    area_list = [a for a in areas if a.get("points")]
+    # A valid polygon needs at least 3 vertices; skip anything degenerate.
+    # The MARD parser already filters, but doing it here too keeps the
+    # renderer safe against any caller that bypasses that path.
+    area_list = [a for a in areas if len(a.get("points") or []) >= 3]
     if not area_list:
         return _empty_svg(width, title)
 

@@ -15,6 +15,30 @@ from typing import Any
 import yaml
 
 
+class _IndentedDumper(yaml.SafeDumper):
+    """Indent list items under their parent key.
+
+    PyYAML's default sequence layout puts the ``-`` at the same column as
+    the parent key:
+
+        cards:
+        - type: tile
+
+    Every HA documentation example uses the indented form instead:
+
+        cards:
+          - type: tile
+
+    Both are valid YAML, but pasting the flat form into a dashboard next
+    to the user's existing cards is visually jarring. Overriding
+    ``increase_indent`` with ``indentless=False`` flips PyYAML to the
+    indented style without any post-processing.
+    """
+
+    def increase_indent(self, flow: bool = False, indentless: bool = False) -> None:  # noqa: ARG002
+        return super().increase_indent(flow, False)
+
+
 def build_vacuum_dashboard_yaml(
     vacuum_entity_id: str,
     image_entity_id: str | None,
@@ -88,6 +112,13 @@ def build_vacuum_dashboard_yaml(
     # ``sort_keys=False`` keeps the structure in the order a reader expects
     # (``type`` first, ``entity`` next, etc.). ``default_flow_style=False``
     # forces block-style so the paste looks like idiomatic Lovelace YAML.
-    return yaml.safe_dump(
-        document, sort_keys=False, default_flow_style=False
+    # ``allow_unicode=True`` lets non-ASCII characters (the ellipsis in the
+    # "Pick rooms…" label, room names with accents) render as themselves
+    # instead of ``…``-style escape sequences.
+    return yaml.dump(
+        document,
+        Dumper=_IndentedDumper,
+        sort_keys=False,
+        default_flow_style=False,
+        allow_unicode=True,
     )

@@ -104,12 +104,13 @@ def test_minimal_output_has_only_tile_and_picker() -> None:
     assert types == ["tile", "button"]
 
 
-def test_output_is_block_style_yaml() -> None:
-    """The dump uses block style so the paste reads like idiomatic Lovelace.
+def test_output_is_block_style_yaml_with_indented_sequences() -> None:
+    """The dump matches HA documentation house style: block + indented seqs.
 
-    Default-flow YAML (`{type: tile, entity: ...}`) is valid but jarring
-    next to the rest of a dashboard. ``default_flow_style=False`` keeps
-    everything in the expected indented form.
+    PyYAML's default sequence layout puts the ``-`` flush with the parent
+    key column, which is valid YAML but visually unlike every example in
+    HA docs. The custom dumper forces sequence items to be indented under
+    their parent so the paste blends in next to existing dashboard YAML.
     """
     raw = build_vacuum_dashboard_yaml(
         vacuum_entity_id="vacuum.sharknado",
@@ -117,7 +118,27 @@ def test_output_is_block_style_yaml() -> None:
         preset_button_entity_ids=[],
     )
 
-    # Block-style YAML has '- type:' on its own line for list entries.
-    assert "- type:" in raw
-    # And no flow-style braces around the top-level document.
+    # Block-style: no flow-style braces around the top-level document.
     assert not raw.lstrip().startswith("{")
+    # Indented sequences: list items under ``cards`` start with two
+    # leading spaces, not zero.
+    assert "\n  - type:" in raw
+    assert "\n- type:" not in raw
+
+
+def test_output_preserves_unicode_characters() -> None:
+    """Non-ASCII characters (eg the ellipsis in "Pick rooms…") render as
+    themselves, not as ``\\u2026`` escape sequences.
+
+    PyYAML defaults to ASCII-only output for safety, which results in
+    literal ``\\u2026`` strings appearing in the pasted dashboard YAML.
+    ``allow_unicode=True`` keeps the source characters intact.
+    """
+    raw = build_vacuum_dashboard_yaml(
+        vacuum_entity_id="vacuum.sharknado",
+        image_entity_id=None,
+        preset_button_entity_ids=[],
+    )
+
+    assert "…" in raw
+    assert "\\u2026" not in raw

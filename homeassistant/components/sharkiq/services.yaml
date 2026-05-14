@@ -36,3 +36,9 @@ clean_room:
             - "Eco"
             - "Normal"
             - "Max"
+
+dashboard_yaml:
+  target:
+    entity:
+      integration: "sharkiq"
+      domain: "vacuum"

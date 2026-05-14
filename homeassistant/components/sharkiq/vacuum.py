@@ -7,6 +7,7 @@ from typing import Any
 
 from sharkiq import OperatingModes, PowerModes, Properties
 
+from homeassistant.components.image import DOMAIN as IMAGE_DOMAIN
 from homeassistant.components.vacuum import (
     StateVacuumEntity,
     VacuumActivity,
@@ -14,12 +15,23 @@ from homeassistant.components.vacuum import (
 )
 from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import ServiceValidationError
+from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
-from .const import ATTR_ROOMS, DOMAIN, LOGGER, SHARK
+from .const import (
+    ATTR_ROOMS,
+    CONF_PRESETS,
+    DOMAIN,
+    LOGGER,
+    PRESET_ID,
+    PRESET_NAME,
+    PRESET_SERIAL,
+    SHARK,
+)
 from .coordinator import SharkDevice, SharkIqConfigEntry, SharkIqUpdateCoordinator
+from .dashboard_yaml import build_vacuum_dashboard_yaml
 
 OPERATING_STATE_MAP = {
     OperatingModes.PAUSE: VacuumActivity.PAUSED,
@@ -252,6 +264,44 @@ class SharkVacuumEntity(CoordinatorEntity[SharkIqUpdateCoordinator], StateVacuum
         else:
             await self.sharkiq.async_clean_rooms(rooms_to_clean)
         await self.coordinator.async_refresh()
+
+    async def async_dashboard_yaml(self) -> dict[str, str]:
+        """Return a ready-to-paste Lovelace YAML block for this vacuum.
+
+        Resolves the vacuum's own entity ID, the floor-plan image entity ID
+        (when this device has MARD geometry), and every preset button entity
+        configured for this vacuum, then renders a single ``vertical-stack``
+        card the user can paste into their dashboard.
+
+        Entity IDs are looked up via the registry rather than constructed from
+        names, because user-renamed entities keep their unique_id but get a
+        new ``entity_id`` — the registry is the only source that survives
+        renames. Presets are filtered to *this vacuum's* serial so a multi-
+        vacuum household gets one card per vacuum without cross-contamination.
+        """
+        registry = er.async_get(self.hass)
+        serial = self.sharkiq.serial_number
+
+        image_entity_id = registry.async_get_entity_id(
+            IMAGE_DOMAIN, DOMAIN, f"{serial}_floor_plan"
+        )
+
+        preset_entity_ids: list[str] = []
+        for preset in self.coordinator.config_entry.options.get(CONF_PRESETS, []):
+            if preset.get(PRESET_SERIAL) != serial:
+                continue
+            preset_id = preset.get(PRESET_ID) or preset.get(PRESET_NAME, "preset")
+            entity_id = registry.async_get_entity_id(
+                "button", DOMAIN, f"{serial}_preset_{preset_id}"
+            )
+            if entity_id is not None:
+                preset_entity_ids.append(entity_id)
+
+        return {
+            "dashboard_yaml": build_vacuum_dashboard_yaml(
+                self.entity_id, image_entity_id, preset_entity_ids
+            )
+        }
 
     @property
     def fan_speed(self) -> str | None:

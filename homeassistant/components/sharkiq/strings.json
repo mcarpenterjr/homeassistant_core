@@ -136,6 +136,10 @@
         }
       },
       "name": "Clean room"
+    },
+    "dashboard_yaml": {
+      "description": "Returns a ready-to-paste Lovelace YAML block for the targeted vacuum (tile, floor plan, preset buttons, and a quick-pick rooms shortcut). Copy the response and paste it into a new Manual card.",
+      "name": "Get dashboard YAML"
     }
   }
 }

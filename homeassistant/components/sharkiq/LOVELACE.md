@@ -13,6 +13,25 @@ underscores). Preset entity names follow `button.<your_vacuum>_clean_<preset_nam
 
 ---
 
+## Quick path: let the integration generate the YAML for you
+
+**Developer Tools → Actions → `sharkiq.dashboard_yaml`**
+
+1. Action: `sharkiq.dashboard_yaml`
+2. Target: your vacuum entity
+3. **Perform action**
+4. The response panel shows a `dashboard_yaml` value — copy it.
+5. **Settings → Dashboards → (your dashboard) → Edit dashboard → Add card →
+   Manual** → paste → Save.
+
+This builds a card customised to your vacuum: the device tile, the
+floor plan (if the device has a parseable map), every preset button
+you've configured, and a "Pick rooms…" shortcut to the
+`sharkiq.clean_room` form. The handcrafted snippets below remain
+available if you want to compose the layout yourself.
+
+---
+
 ## 1. One-card device controls
 
 A single tile with start / pause / locate / return-to-dock built into

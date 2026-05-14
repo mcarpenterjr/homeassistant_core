@@ -7,7 +7,7 @@ from typing import Any
 import voluptuous as vol
 
 from homeassistant.components.vacuum import DOMAIN as VACUUM_DOMAIN
-from homeassistant.core import HomeAssistant, callback
+from homeassistant.core import HomeAssistant, SupportsResponse, callback
 from homeassistant.helpers import config_validation as cv, service
 
 from .const import (
@@ -21,6 +21,7 @@ from .const import (
 )
 
 SERVICE_CLEAN_ROOM = "clean_room"
+SERVICE_DASHBOARD_YAML = "dashboard_yaml"
 
 
 @callback
@@ -46,6 +47,20 @@ def async_setup_services(hass: HomeAssistant) -> None:
             vol.Optional(ATTR_FAN_SPEED): vol.In(FAN_SPEED_NAMES),
         },
         func="async_clean_room",
+    )
+
+    # ``dashboard_yaml`` is a per-vacuum read action: target a vacuum entity,
+    # get back a YAML blob ready to paste into a Lovelace card. No inputs
+    # beyond the target; the response carries the YAML so users can copy
+    # straight from the Developer Tools form.
+    service.async_register_platform_entity_service(
+        hass,
+        DOMAIN,
+        SERVICE_DASHBOARD_YAML,
+        entity_domain=VACUUM_DOMAIN,
+        schema={},
+        func="async_dashboard_yaml",
+        supports_response=SupportsResponse.ONLY,
     )
 
 

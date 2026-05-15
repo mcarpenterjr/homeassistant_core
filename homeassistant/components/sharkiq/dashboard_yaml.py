@@ -43,6 +43,8 @@ def build_vacuum_dashboard_yaml(
     vacuum_entity_id: str,
     image_entity_id: str | None,
     preset_button_entity_ids: list[str],
+    room_select_switch_entity_ids: list[str] | None = None,
+    clean_selected_button_entity_id: str | None = None,
 ) -> str:
     """Return a YAML string for a single-vacuum dashboard card.
 
@@ -54,10 +56,9 @@ def build_vacuum_dashboard_yaml(
     - The presets ``entities`` card is dropped when the user hasn't
       configured any cleaning presets — an empty card would render as a
       bare title with no controls.
-
-    The "Pick rooms…" navigation button is always emitted: it's the
-    workaround for HA's platform constraint that multi-select selectors
-    only render in service-call forms, not in dashboard entity cards.
+    - The per-room "Pick rooms to clean" card is emitted when this vacuum
+      has MARD-derived select switches. Devices without MARD geometry get
+      a navigate-to-DevTools button as the fallback room picker.
     """
     cards: list[dict[str, Any]] = [
         {
@@ -93,19 +94,36 @@ def build_vacuum_dashboard_yaml(
             }
         )
 
-    cards.append(
-        {
-            "type": "button",
-            "name": "Pick rooms…",
-            "icon": "mdi:broom",
-            "tap_action": {
-                "action": "navigate",
-                "navigation_path": (
-                    "/developer-tools/action?domain=sharkiq&service=clean_room"
-                ),
-            },
-        }
-    )
+    select_switches = list(room_select_switch_entity_ids or [])
+    if select_switches and clean_selected_button_entity_id is not None:
+        cards.append(
+            {
+                "type": "entities",
+                "title": "Pick rooms to clean",
+                "show_header_toggle": False,
+                "entities": [
+                    *select_switches,
+                    clean_selected_button_entity_id,
+                ],
+            }
+        )
+    else:
+        # Fallback for devices without per-room switches (legacy Ayla, or
+        # a device whose MARD didn't parse): point to the service-call
+        # form so users still have a way to pick rooms ad hoc.
+        cards.append(
+            {
+                "type": "button",
+                "name": "Pick rooms…",
+                "icon": "mdi:broom",
+                "tap_action": {
+                    "action": "navigate",
+                    "navigation_path": (
+                        "/developer-tools/action?domain=sharkiq&service=clean_room"
+                    ),
+                },
+            }
+        )
 
     document: dict[str, Any] = {"type": "vertical-stack", "cards": cards}
 

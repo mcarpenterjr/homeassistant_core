@@ -269,18 +269,19 @@ class SharkVacuumEntity(CoordinatorEntity[SharkIqUpdateCoordinator], StateVacuum
         """Return a ready-to-paste Lovelace YAML block for this vacuum.
 
         Resolves the vacuum's own entity ID, the floor-plan image entity ID
-        (when this device has MARD geometry), and every preset button entity
-        configured for this vacuum, then renders a single ``vertical-stack``
-        card the user can paste into their dashboard.
+        (when this device has MARD geometry), every preset button, every
+        room-select switch, and the Clean-selected-rooms button, then
+        renders a single ``vertical-stack`` card the user can paste.
 
         Entity IDs are looked up via the registry rather than constructed from
         names, because user-renamed entities keep their unique_id but get a
         new ``entity_id`` — the registry is the only source that survives
-        renames. Presets are filtered to *this vacuum's* serial so a multi-
-        vacuum household gets one card per vacuum without cross-contamination.
+        renames. Filtering by the registry's config_entry_id keeps multi-
+        vacuum households from cross-contaminating each other's cards.
         """
         registry = er.async_get(self.hass)
         serial = self.sharkiq.serial_number
+        entry_id = self.coordinator.config_entry.entry_id
 
         image_entity_id = registry.async_get_entity_id(
             IMAGE_DOMAIN, DOMAIN, f"{serial}_floor_plan"
@@ -297,9 +298,30 @@ class SharkVacuumEntity(CoordinatorEntity[SharkIqUpdateCoordinator], StateVacuum
             if entity_id is not None:
                 preset_entity_ids.append(entity_id)
 
+        # Pull the per-room select switches off the registry and sort by
+        # entity_id so the dashboard ordering is stable across HA restarts —
+        # the underlying MARD list ordering is too, but registry iteration
+        # is not guaranteed to follow it.
+        select_switch_entity_ids: list[str] = []
+        for entry in er.async_entries_for_config_entry(registry, entry_id):
+            if entry.domain != "switch":
+                continue
+            unique_id = entry.unique_id or ""
+            if unique_id.startswith(f"{serial}_select_"):
+                select_switch_entity_ids.append(entry.entity_id)
+        select_switch_entity_ids.sort()
+
+        clean_selected_entity_id = registry.async_get_entity_id(
+            "button", DOMAIN, f"{serial}_clean_selected"
+        )
+
         return {
             "dashboard_yaml": build_vacuum_dashboard_yaml(
-                self.entity_id, image_entity_id, preset_entity_ids
+                self.entity_id,
+                image_entity_id,
+                preset_entity_ids,
+                room_select_switch_entity_ids=select_switch_entity_ids,
+                clean_selected_button_entity_id=clean_selected_entity_id,
             )
         }
 

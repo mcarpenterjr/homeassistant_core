@@ -228,36 +228,71 @@ def _async_remove_orphan_entities(
 ) -> None:
     """Drop entity-registry rows for unique_ids we no longer create.
 
-    The integration has gone through three room-cleaning UX iterations:
+    Two flavors of orphan:
 
-    1. One ``button.<vac>_clean_<room>`` per room — replaced in iteration 2.
-    2. Queue switches + clean-mode select + single start button — replaced
-       in iteration 3 because the composer was clunky to use on a Lovelace
-       card.
-    3. Per-preset buttons configured via the options flow (current).
+    Legacy UX iterations — the integration has gone through earlier room-
+    cleaning composer designs that left behind unique_ids we never
+    recreate:
 
-    Without explicit cleanup, registry rows from prior iterations linger
-    forever and clutter every device card. We match by unique_id prefix
-    so we don't accidentally remove the new ``{serial}_preset_...`` rows.
+    1. One ``button.<vac>_clean_<room>`` per room.
+    2. Queue switches + clean-mode select + single start button.
+
+    Renamed/removed rooms — per-room select switches use a unique_id of
+    the form ``{serial}_select_<slug>``. When the user renames or merges a
+    room in the SharkClean app the MARD signature changes and the old slug
+    no longer maps to a current room. Without this cleanup, every rename
+    leaves behind a dead switch that looks identical to the new one but
+    does nothing.
+
+    The exclusion list keeps current entities (``_preset_`` buttons, the
+    ``_clean_selected`` button) safe from the legacy substring matches.
     """
+    from homeassistant.util import slugify  # late import: top of-module cycle
+
     registry = er.async_get(hass)
     entries = er.async_entries_for_config_entry(registry, config_entry.entry_id)
     serials = set(coordinator.shark_vacs)
+
     # (entity_domain, unique_id_substring) — substring lookup keeps us safe
-    # when prefix shapes shift (e.g. "{serial}_clean_<room>" vs
-    # "{serial}_start_room_clean").
+    # when prefix shapes shift.
     stale_substrings_by_domain: dict[str, tuple[str, ...]] = {
         "button": ("_clean_", "_start_room_clean"),
         "select": ("_clean_type",),
         "switch": ("_queue_",),
     }
+    # Current-design substrings to protect from the legacy matchers above.
+    current_substrings = ("_preset_", "_clean_selected", "_select_")
+
+    # Build the current set of valid select-switch unique_ids for the
+    # rename/merge orphan check.
+    valid_select_unique_ids: set[str] = set()
+    for device in coordinator.shark_vacs.values():
+        display_rooms = getattr(device, "display_rooms", None) or {}
+        for room_name in display_rooms:
+            valid_select_unique_ids.add(
+                f"{device.serial_number}_select_{slugify(room_name)}"
+            )
+
     for entry in entries:
+        unique_id = entry.unique_id or ""
+
+        # Renamed/removed room cleanup: any select switch whose unique_id
+        # isn't in the current valid set.
+        if entry.domain == "switch" and "_select_" in unique_id:
+            if unique_id not in valid_select_unique_ids:
+                LOGGER.debug(
+                    "Removing orphan select switch %s (%s)",
+                    entry.entity_id,
+                    unique_id,
+                )
+                registry.async_remove(entry.entity_id)
+            continue
+
+        # Legacy UX cleanup.
         substrings = stale_substrings_by_domain.get(entry.domain)
         if substrings is None:
             continue
-        unique_id = entry.unique_id or ""
-        # Skip new-style preset buttons even though they share a domain.
-        if "_preset_" in unique_id:
+        if any(s in unique_id for s in current_substrings):
             continue
         for serial in serials:
             if not unique_id.startswith(serial):

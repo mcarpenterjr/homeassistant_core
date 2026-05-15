@@ -663,14 +663,24 @@ class SkegoxDevice:
         entries (merged areas), all underlying names are expanded into the
         payload so the robot cleans the full merged area.
 
-        Different device generations use different shadow keys:
-        - ``AreasToClean_V3``: object form ``{"UserRoom": [...]}``
-        - ``AreasToClean_V2``: string-array form ``["UserRoom:Name"]``
-        - ``Areas_To_Clean``: legacy string-array form (same payload as V2)
+        Wire format preference is **V2 first**, then V3, then the legacy
+        ``Areas_To_Clean`` blob. A live capture of what the SharkClean app
+        writes when starting a room clean confirmed V2 is the active
+        channel on current-gen devices, with V3 present in the shadow but
+        unused (``reported = None`` / ``desired = None``). Earlier code
+        guessed at V3's shape and wrote there preferentially, which the
+        device ignored — that's the "gets lost" symptom users see when
+        HA-issued room cleans don't behave like app-issued ones.
 
-        ``clean_type`` is sent in the V3 payload (the only variant that
-        carries it in the shadow) and is otherwise informational. Valid
-        values observed in the wild: ``"dry"``, ``"wet"``.
+        V2 / legacy payload shape::
+
+            {"floor_id": "<id>",
+             "areas_to_clean": ["UserRoom:Name", "UserRoom:Other"],
+             "clean_count": 1}
+
+        ``clean_type`` has no slot in V2; it's passed through for the V3
+        fallback path, where we still guess the shape but at least won't
+        block the V2-only majority case.
         """
         rooms = self._expand_display_rooms(rooms)
         room_list = self.get_property_value("Robot_Room_List")
@@ -678,7 +688,20 @@ class SkegoxDevice:
         if not floor_id and room_list and ":" in room_list:
             floor_id = room_list.split(":")[0]
 
-        if "AreasToClean_V3" in self.properties_full:
+        v2_payload = json.dumps(
+            {
+                "floor_id": floor_id,
+                "areas_to_clean": [f"UserRoom:{room}" for room in rooms],
+                "clean_count": 1,
+            }
+        )
+
+        if "AreasToClean_V2" in self.properties_full:
+            await self.async_set_property_value("AreasToClean_V2", v2_payload)
+        elif "AreasToClean_V3" in self.properties_full:
+            # V3 shape is still a guess — preserved as a fallback for any
+            # device generation that genuinely uses V3 instead of V2. The
+            # captured-from-app evidence so far only covers V2 devices.
             payload = json.dumps(
                 {
                     "areas_to_clean": {"UserRoom": rooms},
@@ -688,26 +711,8 @@ class SkegoxDevice:
                 }
             )
             await self.async_set_property_value("AreasToClean_V3", payload)
-        elif "AreasToClean_V2" in self.properties_full:
-            areas = [f"UserRoom:{room}" for room in rooms]
-            payload = json.dumps(
-                {
-                    "floor_id": floor_id,
-                    "areas_to_clean": areas,
-                    "clean_count": 1,
-                }
-            )
-            await self.async_set_property_value("AreasToClean_V2", payload)
         else:
-            areas = [f"UserRoom:{room}" for room in rooms]
-            payload = json.dumps(
-                {
-                    "floor_id": floor_id,
-                    "areas_to_clean": areas,
-                    "clean_count": 1,
-                }
-            )
-            await self.async_set_property_value("Areas_To_Clean", payload)
+            await self.async_set_property_value("Areas_To_Clean", v2_payload)
 
         # Start cleaning after setting rooms
         await self.async_set_operating_mode(2)  # OperatingModes.START

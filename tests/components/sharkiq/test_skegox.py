@@ -523,12 +523,25 @@ async def test_skegox_load_mard_caches_polygon_geometry() -> None:
     ]
 
 
-async def test_skegox_clean_rooms_uses_mard_floor_id_and_expansion() -> None:
-    """Clean payload uses the MARD floor_id and expands merged display rooms."""
+async def test_skegox_clean_rooms_prefers_v2_when_both_keys_present() -> None:
+    """V2 wins over V3 when both shadow keys exist.
+
+    A live capture of the SharkClean app's wire format showed V2 carries
+    the room set while V3 sits null on current-gen devices. Preferring
+    V3 (the previous behavior) shipped a payload the device ignored,
+    which is the "gets lost when HA tells it to clean specific rooms"
+    symptom users report.
+    """
     device = SkegoxDevice(MockSkegoxApi(), "household", deepcopy(SKEGOX_DEVICE_DATA))
     device._display_rooms = {"Kitchen": ["AZ_3", "AZ_4"]}
     device._mard_floor_id = "FLOOR_MARD"
-    # Force V3 payload path — newer devices use it exclusively.
+    # Mirror the real-device shape: both V2 and V3 keys exist in the
+    # shadow. V2 is the actual active channel.
+    device.properties_full["AreasToClean_V2"] = {
+        "value": "",
+        "read_only": False,
+        "base_type": "str",
+    }
     device.properties_full["AreasToClean_V3"] = {
         "value": "",
         "read_only": False,
@@ -546,6 +559,45 @@ async def test_skegox_clean_rooms_uses_mard_floor_id_and_expansion() -> None:
 
     import json as _json
 
-    payload = _json.loads(captured["AreasToClean_V3"])
+    assert "AreasToClean_V3" not in captured
+    payload = _json.loads(captured["AreasToClean_V2"])
     assert payload["floor_id"] == "FLOOR_MARD"
-    assert payload["areas_to_clean"] == {"UserRoom": ["AZ_3", "AZ_4"]}
+    # V2 uses the colon-prefixed string-array shape — captured verbatim
+    # from the app's actual writes.
+    assert payload["areas_to_clean"] == ["UserRoom:AZ_3", "UserRoom:AZ_4"]
+    assert payload["clean_count"] == 1
+
+
+async def test_skegox_clean_rooms_falls_back_to_v3_when_v2_absent() -> None:
+    """Devices without V2 still get the guessed V3 payload as a fallback.
+
+    We don't have captured evidence that V3's shape is correct, but if a
+    device only exposes V3 in its shadow, sending something is better
+    than failing silently. The guessed shape stays as-is until we get a
+    capture from a V3-only device.
+    """
+    device = SkegoxDevice(MockSkegoxApi(), "household", deepcopy(SKEGOX_DEVICE_DATA))
+    device._display_rooms = {"Kitchen": ["AZ_3"]}
+    device._mard_floor_id = "FLOOR_MARD"
+    device.properties_full["AreasToClean_V3"] = {
+        "value": "",
+        "read_only": False,
+        "base_type": "str",
+    }
+    # Ensure V2 is *not* in properties_full — emulate a V3-only shadow.
+    device.properties_full.pop("AreasToClean_V2", None)
+
+    captured: dict[str, Any] = {}
+
+    async def _capture(property_name: Any, value: Any) -> None:
+        captured.setdefault(property_name, value)
+
+    device.async_set_property_value = _capture  # type: ignore[method-assign]
+
+    await device.async_clean_rooms(["Kitchen"])
+
+    import json as _json
+
+    assert "AreasToClean_V2" not in captured
+    payload = _json.loads(captured["AreasToClean_V3"])
+    assert payload["areas_to_clean"] == {"UserRoom": ["AZ_3"]}

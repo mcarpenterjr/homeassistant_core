@@ -199,9 +199,91 @@ class SharkVacuumEntity(CoordinatorEntity[SharkIqUpdateCoordinator], StateVacuum
         await self.coordinator.async_refresh()
 
     async def async_start(self) -> None:
-        """Start the device."""
+        """Start the device.
+
+        Selection-aware: if any of this vacuum's per-room ``Select …``
+        switches are currently on, dispatches a ``clean_room`` against
+        those rooms and resets the switches afterward. Otherwise falls
+        through to the full-clean path. This folds the previous
+        ``Clean selected rooms`` button into the vacuum tile's Start
+        button so users have one entry point instead of two.
+
+        HA's tile-card ``vacuum-commands`` feature draws the Start label
+        verbatim — we can't rename it to "Start cleaning selected" based
+        on state. The behavior is contextual; the label stays "Start".
+        """
+        selected = self._read_selected_rooms()
+        if selected:
+            LOGGER.debug(
+                "Start pressed with %d room(s) selected; routing to clean_room: %s",
+                len(selected),
+                selected,
+            )
+            await self.async_clean_room(rooms=selected)
+            await self._reset_selected_switches()
+            return
+
         await self.sharkiq.async_set_operating_mode(OperatingModes.START)
         await self.coordinator.async_refresh()
+
+    def _read_selected_rooms(self) -> list[str]:
+        """Return display room names whose ``Select …`` switch is currently on.
+
+        Registry-driven so user-renamed entity_ids still resolve. Falls
+        back gracefully if a switch isn't materialised in the state
+        machine yet (just-restarted HA with the entity not yet added).
+        """
+        registry = er.async_get(self.hass)
+        serial = self.sharkiq.serial_number
+        entry_id = self.coordinator.config_entry.entry_id
+        prefix = f"{serial}_select_"
+        rooms: list[str] = []
+        for entry in er.async_entries_for_config_entry(registry, entry_id):
+            if entry.domain != "switch":
+                continue
+            if not (entry.unique_id or "").startswith(prefix):
+                continue
+            state = self.hass.states.get(entry.entity_id)
+            if state is None or state.state != "on":
+                continue
+            attrs = state.attributes
+            friendly = attrs.get("friendly_name")
+            if isinstance(friendly, str) and friendly.startswith("Select "):
+                rooms.append(friendly[len("Select ") :])
+                continue
+            # Last-resort fallback: title-case the slug portion.
+            slug = (entry.unique_id or "")[len(prefix) :]
+            rooms.append(slug.replace("_", " ").title())
+        return rooms
+
+    async def _reset_selected_switches(self) -> None:
+        """Turn off every ``Select …`` switch on this vacuum.
+
+        Mirrors the previous ``Clean selected rooms`` button's reset
+        behavior: dispatching the clean means the user "consumed" the
+        selection, so the next press starts from a fresh state. Uses
+        ``switch.turn_off`` via the service registry so each
+        :class:`SharkRoomSelectSwitch` persists the new state through
+        ``RestoreEntity``.
+        """
+        registry = er.async_get(self.hass)
+        serial = self.sharkiq.serial_number
+        entry_id = self.coordinator.config_entry.entry_id
+        prefix = f"{serial}_select_"
+        for entry in er.async_entries_for_config_entry(registry, entry_id):
+            if entry.domain != "switch":
+                continue
+            if not (entry.unique_id or "").startswith(prefix):
+                continue
+            state = self.hass.states.get(entry.entity_id)
+            if state is None or state.state != "on":
+                continue
+            await self.hass.services.async_call(
+                "switch",
+                "turn_off",
+                {"entity_id": entry.entity_id},
+                blocking=False,
+            )
 
     async def async_stop(self, **kwargs: Any) -> None:
         """Stop the device."""
@@ -311,17 +393,12 @@ class SharkVacuumEntity(CoordinatorEntity[SharkIqUpdateCoordinator], StateVacuum
                 select_switch_entity_ids.append(entry.entity_id)
         select_switch_entity_ids.sort()
 
-        clean_selected_entity_id = registry.async_get_entity_id(
-            "button", DOMAIN, f"{serial}_clean_selected"
-        )
-
         return {
             "dashboard_yaml": build_vacuum_dashboard_yaml(
                 self.entity_id,
                 image_entity_id,
                 preset_entity_ids,
                 room_select_switch_entity_ids=select_switch_entity_ids,
-                clean_selected_button_entity_id=clean_selected_entity_id,
             )
         }
 

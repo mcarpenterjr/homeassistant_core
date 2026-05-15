@@ -1,14 +1,16 @@
-"""Buttons for Shark IQ vacuums.
+"""Per-preset 'Clean rooms' buttons for Shark IQ vacuums.
 
-Two flavors:
+Each cleaning preset configured in the integration's options flow becomes
+a button on the vacuum's device card. Pressing the button dispatches the
+``sharkiq.clean_room`` service against the target vacuum with the rooms,
+clean mode, and fan speed bundled in the preset, so all the room-cleaning
+logic lives in one place (the service / vacuum entity method) and the
+button is just a one-tap shortcut.
 
-- :class:`SharkPresetCleanButton` — one per user-defined cleaning preset.
-  Bundles rooms + clean mode + fan speed; one tap dispatches ``clean_room``.
-- :class:`SharkCleanSelectedRoomsButton` — one per vacuum. Reads the
-  vacuum's per-room "Select" switches and dispatches a clean of every
-  selected room, then resets the switches off. This is the ad-hoc picker
-  HA's dashboard primitives can't provide directly (no multi-select widget
-  outside of service-call forms).
+Ad-hoc multi-room cleans use the vacuum tile's Start button: when any of
+the vacuum's ``Select …`` switches are on, Start dispatches ``clean_room``
+against those rooms instead of doing a full clean. The room picker is the
+switches; the dispatcher is the standard Start button.
 """
 
 from __future__ import annotations
@@ -16,9 +18,7 @@ from __future__ import annotations
 from typing import Any
 
 from homeassistant.components.button import ButtonEntity
-from homeassistant.components.switch import DOMAIN as SWITCH_DOMAIN
 from homeassistant.components.vacuum import DOMAIN as VACUUM_DOMAIN
-from homeassistant.const import STATE_ON
 from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers import entity_registry as er
@@ -50,10 +50,10 @@ async def async_setup_entry(
     config_entry: SharkIqConfigEntry,
     async_add_entities: AddConfigEntryEntitiesCallback,
 ) -> None:
-    """Create preset buttons + one Clean-selected button per vacuum."""
+    """Create one button per configured cleaning preset."""
     coordinator = config_entry.runtime_data
     presets = config_entry.options.get(CONF_PRESETS, [])
-    entities: list[ButtonEntity] = []
+    entities: list[SharkPresetCleanButton] = []
     for preset in presets:
         serial = preset.get(PRESET_SERIAL)
         device = coordinator.shark_vacs.get(serial)
@@ -65,14 +65,6 @@ async def async_setup_entry(
             )
             continue
         entities.append(SharkPresetCleanButton(device, coordinator, preset))
-
-    # Only emit a "Clean selected rooms" button for vacuums that actually
-    # have per-room select switches — i.e. MARD-derived display rooms.
-    # Without switches the button would always be a no-op.
-    for device in coordinator.shark_vacs.values():
-        if getattr(device, "display_rooms", None):
-            entities.append(SharkCleanSelectedRoomsButton(device, coordinator))
-
     if entities:
         async_add_entities(entities)
 
@@ -153,129 +145,3 @@ class SharkPresetCleanButton(
             target={"entity_id": vacuum_entity_id},
             blocking=True,
         )
-
-
-class SharkCleanSelectedRoomsButton(
-    CoordinatorEntity[SharkIqUpdateCoordinator], ButtonEntity
-):
-    """Dispatches a clean across every room whose select switch is on.
-
-    The room set is read live from the entity registry + state machine,
-    not cached, so the user can toggle switches in any order before
-    pressing this button without the integration having to track the
-    selection itself. After dispatch the matching switches are turned off
-    so the next clean starts from a fresh selection — presets exist for
-    the "save this combo" use case.
-    """
-
-    _attr_has_entity_name = True
-    _attr_icon = "mdi:broom"
-    _attr_translation_key = "clean_selected_rooms"
-
-    def __init__(
-        self,
-        sharkiq: SharkDevice,
-        coordinator: SharkIqUpdateCoordinator,
-    ) -> None:
-        """Bind to a parent SharkDevice."""
-        super().__init__(coordinator)
-        self._sharkiq = sharkiq
-        self._attr_unique_id = f"{sharkiq.serial_number}_clean_selected"
-        self._attr_device_info = DeviceInfo(
-            identifiers={(DOMAIN, sharkiq.serial_number)},
-            manufacturer=SHARK,
-            name=sharkiq.name,
-        )
-
-    @property
-    def available(self) -> bool:
-        """Available when the vacuum is online and the coordinator is fresh."""
-        return (
-            self.coordinator.has_recent_success
-            and self.coordinator.device_is_online(self._sharkiq.serial_number)
-        )
-
-    async def async_press(self) -> None:
-        """Read selected rooms from this vacuum's switches and dispatch."""
-        registry = er.async_get(self.hass)
-        serial = self._sharkiq.serial_number
-
-        # Look the switches up via the registry rather than constructing the
-        # entity IDs from slugs — users can rename entity IDs, but the
-        # unique_id is stable. The runtime ``data`` map carries the entity
-        # objects, which we need for both reading state and turning them off.
-        select_switches: dict[str, str] = {}
-        for entity in er.async_entries_for_config_entry(
-            registry, self.coordinator.config_entry.entry_id
-        ):
-            if entity.domain != SWITCH_DOMAIN:
-                continue
-            unique_id = entity.unique_id or ""
-            prefix = f"{serial}_select_"
-            if not unique_id.startswith(prefix):
-                continue
-            select_switches[entity.entity_id] = unique_id
-
-        rooms: list[str] = []
-        on_entity_ids: list[str] = []
-        for entity_id in select_switches:
-            state = self.hass.states.get(entity_id)
-            if state is None or state.state != STATE_ON:
-                continue
-            on_entity_ids.append(entity_id)
-            # The unique_id slug is lossy for room names with punctuation,
-            # so resolve the display name from the switch's friendly_name
-            # (set to "Select <Room>" at construction time).
-            rooms.append(_resolve_room_name(entity_id, state.attributes))
-
-        if not rooms:
-            raise HomeAssistantError(
-                "No rooms are selected — toggle at least one Select switch "
-                "on before pressing Clean selected rooms"
-            )
-
-        vacuum_entity_id = registry.async_get_entity_id(
-            VACUUM_DOMAIN, DOMAIN, serial
-        )
-        if vacuum_entity_id is None:
-            raise HomeAssistantError(
-                f"Vacuum entity for {self._sharkiq.name} not found"
-            )
-
-        LOGGER.debug(
-            "Clean Selected pressed for %s: %s", self._sharkiq.name, rooms
-        )
-        await self.hass.services.async_call(
-            DOMAIN,
-            SERVICE_CLEAN_ROOM,
-            {ATTR_ROOMS: rooms},
-            target={"entity_id": vacuum_entity_id},
-            blocking=True,
-        )
-
-        # Reset the switches that participated in this clean. Use the
-        # generic switch.turn_off so the SharkRoomSelectSwitch's own
-        # async_turn_off persists state through RestoreEntity.
-        for entity_id in on_entity_ids:
-            await self.hass.services.async_call(
-                SWITCH_DOMAIN,
-                "turn_off",
-                {"entity_id": entity_id},
-                blocking=False,
-            )
-
-
-def _resolve_room_name(entity_id: str, attributes: dict[str, Any]) -> str:
-    """Return the display room name a select switch represents.
-
-    Tries the entity's friendly name first (the switch sets it to
-    ``Select <Room>``), falls back to the entity_id slug for safety.
-    """
-    friendly = attributes.get("friendly_name")
-    if isinstance(friendly, str) and friendly.startswith("Select "):
-        return friendly[len("Select ") :]
-    # Last-resort fallback: turn "switch.<vac>_select_<room_slug>" into
-    # something we can pass — title-case the slug.
-    object_id = entity_id.split(".", 1)[-1]
-    _, _, slug = object_id.partition("_select_")
-    return slug.replace("_", " ").title()

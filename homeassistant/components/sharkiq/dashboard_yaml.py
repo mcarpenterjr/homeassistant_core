@@ -44,7 +44,6 @@ def build_vacuum_dashboard_yaml(
     image_entity_id: str | None,
     preset_button_entity_ids: list[str],
     room_select_switch_entity_ids: list[str] | None = None,
-    clean_selected_button_entity_id: str | None = None,
 ) -> str:
     """Return a YAML string for a single-vacuum dashboard card.
 
@@ -57,8 +56,10 @@ def build_vacuum_dashboard_yaml(
       configured any cleaning presets — an empty card would render as a
       bare title with no controls.
     - The per-room "Pick rooms to clean" card is emitted when this vacuum
-      has MARD-derived select switches. Devices without MARD geometry get
-      a navigate-to-DevTools button as the fallback room picker.
+      has MARD-derived select switches. Pressing Start on the vacuum tile
+      then dispatches a clean against the on switches (and resets them).
+      Devices without MARD geometry get a navigate-to-DevTools button as
+      the fallback room picker.
     """
     cards: list[dict[str, Any]] = [
         {
@@ -95,16 +96,13 @@ def build_vacuum_dashboard_yaml(
         )
 
     select_switches = list(room_select_switch_entity_ids or [])
-    if select_switches and clean_selected_button_entity_id is not None:
+    if select_switches:
         cards.append(
             {
                 "type": "entities",
-                "title": "Pick rooms to clean",
+                "title": "Pick rooms to clean (then press Start on the tile)",
                 "show_header_toggle": False,
-                "entities": [
-                    *select_switches,
-                    clean_selected_button_entity_id,
-                ],
+                "entities": list(select_switches),
             }
         )
     else:

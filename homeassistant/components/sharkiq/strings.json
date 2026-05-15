@@ -96,11 +96,6 @@
     }
   },
   "entity": {
-    "button": {
-      "clean_selected_rooms": {
-        "name": "Clean selected rooms"
-      }
-    },
     "image": {
       "floor_plan": {
         "name": "Floor plan"

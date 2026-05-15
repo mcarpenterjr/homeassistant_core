@@ -261,7 +261,11 @@ def _async_remove_orphan_entities(
         "switch": ("_queue_",),
     }
     # Current-design substrings to protect from the legacy matchers above.
-    current_substrings = ("_preset_", "_clean_selected", "_select_")
+    # ``_clean_selected`` is intentionally NOT here: a previous iteration
+    # shipped a SharkCleanSelectedRoomsButton with that suffix and the
+    # current design (selection-aware Start) doesn't recreate it. Letting
+    # it match the legacy ``_clean_`` substring drops the orphan cleanly.
+    current_substrings = ("_preset_", "_select_")
 
     # Build the current set of valid select-switch unique_ids for the
     # rename/merge orphan check.

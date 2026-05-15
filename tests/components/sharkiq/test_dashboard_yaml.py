@@ -127,12 +127,11 @@ def test_output_is_block_style_yaml_with_indented_sequences() -> None:
 
 
 def test_output_emits_room_picker_when_switches_present() -> None:
-    """With per-room switches + clean-selected button, the room picker card
-    replaces the fallback navigate button.
+    """With per-room switches the picker card replaces the navigate fallback.
 
-    This is the on-dashboard ad-hoc picker we built switches to enable —
-    without it the user has no way to pick rooms without leaving the
-    dashboard.
+    Dispatch lives on the vacuum tile's Start button (selection-aware), so
+    the picker card lists only switches — no separate "clean selected"
+    button entity. The header text reminds users where the dispatcher is.
     """
     raw = build_vacuum_dashboard_yaml(
         vacuum_entity_id="vacuum.sharknado",
@@ -142,21 +141,17 @@ def test_output_emits_room_picker_when_switches_present() -> None:
             "switch.sharknado_select_kitchen",
             "switch.sharknado_select_bedroom",
         ],
-        clean_selected_button_entity_id="button.sharknado_clean_selected",
     )
 
     doc = yaml.safe_load(raw)
     types = [c["type"] for c in doc["cards"]]
 
-    # No fallback navigate button when the real picker is available.
     assert types == ["tile", "picture-entity", "entities"]
     picker = doc["cards"][2]
-    assert picker["title"] == "Pick rooms to clean"
-    # Switches first, dispatch button last.
+    assert "Pick rooms to clean" in picker["title"]
     assert picker["entities"] == [
         "switch.sharknado_select_kitchen",
         "switch.sharknado_select_bedroom",
-        "button.sharknado_clean_selected",
     ]
 
 
@@ -172,7 +167,6 @@ def test_output_falls_back_to_navigate_button_without_switches() -> None:
         image_entity_id=None,
         preset_button_entity_ids=[],
         room_select_switch_entity_ids=[],
-        clean_selected_button_entity_id=None,
     )
 
     doc = yaml.safe_load(raw)

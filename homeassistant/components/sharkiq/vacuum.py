@@ -227,33 +227,48 @@ class SharkVacuumEntity(CoordinatorEntity[SharkIqUpdateCoordinator], StateVacuum
         await self.coordinator.async_refresh()
 
     def _read_selected_rooms(self) -> list[str]:
-        """Return display room names whose ``Select …`` switch is currently on.
+        """Return display room names whose select switch is currently on.
 
-        Registry-driven so user-renamed entity_ids still resolve. Falls
-        back gracefully if a switch isn't materialised in the state
-        machine yet (just-restarted HA with the entity not yet added).
+        Matches each switch unique_id (``{serial}_select_<slug>``) back to
+        the device's canonical ``display_rooms`` mapping by slugifying the
+        room name and comparing. This is robust against the switch's
+        friendly_name being customised by the user — the unique_id is
+        stable, and ``display_rooms`` is the authoritative source of room
+        names on the device.
         """
+        from homeassistant.util import slugify
+
         registry = er.async_get(self.hass)
         serial = self.sharkiq.serial_number
         entry_id = self.coordinator.config_entry.entry_id
         prefix = f"{serial}_select_"
+
+        slug_to_room: dict[str, str] = {
+            slugify(name): name
+            for name in (getattr(self.sharkiq, "display_rooms", None) or {})
+        }
+
         rooms: list[str] = []
         for entry in er.async_entries_for_config_entry(registry, entry_id):
             if entry.domain != "switch":
                 continue
-            if not (entry.unique_id or "").startswith(prefix):
+            unique_id = entry.unique_id or ""
+            if not unique_id.startswith(prefix):
                 continue
             state = self.hass.states.get(entry.entity_id)
             if state is None or state.state != "on":
                 continue
-            attrs = state.attributes
-            friendly = attrs.get("friendly_name")
-            if isinstance(friendly, str) and friendly.startswith("Select "):
-                rooms.append(friendly[len("Select ") :])
+            slug = unique_id[len(prefix) :]
+            room = slug_to_room.get(slug)
+            if room is None:
+                # Stale switch whose room was removed/renamed since setup;
+                # skip rather than crash the start.
+                LOGGER.debug(
+                    "Ignoring orphan select switch %s (no matching MARD room)",
+                    entry.entity_id,
+                )
                 continue
-            # Last-resort fallback: title-case the slug portion.
-            slug = (entry.unique_id or "")[len(prefix) :]
-            rooms.append(slug.replace("_", " ").title())
+            rooms.append(room)
         return rooms
 
     async def _reset_selected_switches(self) -> None:

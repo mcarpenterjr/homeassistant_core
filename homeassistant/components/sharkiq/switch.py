@@ -80,7 +80,11 @@ class SharkRoomSelectSwitch(
         self._room_name = room_name
         slug = slugify(room_name)
         self._attr_unique_id = f"{sharkiq.serial_number}_select_{slug}"
-        self._attr_name = f"Select {room_name}"
+        # Entity name is the bare room — the device name in DeviceInfo
+        # already prefixes it on the device card (eg "Clean Latifah Kitchen").
+        # Selection semantics come from the switch being toggleable, not
+        # from the label.
+        self._attr_name = room_name
         self._attr_device_info = DeviceInfo(
             identifiers={(DOMAIN, sharkiq.serial_number)},
             manufacturer=SHARK,

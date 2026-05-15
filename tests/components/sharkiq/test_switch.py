@@ -40,9 +40,10 @@ def test_select_switch_unique_id_uses_room_slug() -> None:
 
 
 def test_select_switch_name_and_room_property() -> None:
-    """Friendly name and ``room_name`` accessor mirror the user-facing label."""
+    """Entity name is the bare room; the device name in DeviceInfo
+    prefixes it on the device card."""
     switch = _make_switch("Kitchen")
-    assert switch.name == "Select Kitchen"
+    assert switch.name == "Kitchen"
     assert switch.room_name == "Kitchen"
 
 

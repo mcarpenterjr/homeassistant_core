@@ -720,9 +720,34 @@ class SkegoxDevice:
     async def async_update(
         self, property_list: Any | None = None
     ) -> None:
-        """Refresh device state from the API."""
+        """Refresh device state from the API.
+
+        Rooms-in-the-app change without any HA-side signal — the user
+        renames or merges a map area in SharkClean and the next shadow
+        poll reflects it in ``Robot_Room_List``. When we see that string
+        change, refetch MARD so display names, polygons, and the
+        room-name expansion in ``async_clean_rooms`` all stay current
+        without requiring an HA restart. Without this, a rename mid-
+        session would have us sending the device a now-nonexistent room
+        name — exactly the "gets lost" symptom that motivated this work.
+        """
+        previous_room_list = self.get_property_value("Robot_Room_List")
         result = await self._api.async_get_device_state(
             self._household_id, self._snd
         )
         self._device_data = result
         self._parse_shadow(result)
+
+        new_room_list = self.get_property_value("Robot_Room_List")
+        if (
+            new_room_list is not None
+            and new_room_list != previous_room_list
+            and previous_room_list is not None
+        ):
+            LOGGER.debug(
+                "Robot_Room_List changed for %s (%r -> %r); refreshing MARD",
+                self._snd,
+                previous_room_list,
+                new_room_list,
+            )
+            await self.async_load_mard()

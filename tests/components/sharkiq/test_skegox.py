@@ -568,6 +568,82 @@ async def test_skegox_clean_rooms_prefers_v2_when_both_keys_present() -> None:
     assert payload["clean_count"] == 1
 
 
+async def test_skegox_update_refetches_mard_when_room_list_changes() -> None:
+    """A change in Robot_Room_List triggers an automatic MARD refresh.
+
+    Users rename and merge map areas in the SharkClean app at any time;
+    without this hook our cached display_rooms would go stale until the
+    next HA restart, and clean dispatches would carry now-nonexistent
+    room names. The check is gated on a *real* change (not the initial
+    None→value transition at setup) to avoid spurious refetches.
+    """
+    device = SkegoxDevice(MockSkegoxApi(), "household", deepcopy(SKEGOX_DEVICE_DATA))
+    # Seed an initial Robot_Room_List so the diff detector has a baseline.
+    device.properties_full["Robot_Room_List"] = {
+        "value": "FLOOR_X:OldName:Kitchen",
+        "read_only": True,
+        "base_type": "str",
+    }
+
+    refresh_calls: list[int] = []
+
+    async def _fake_load_mard() -> None:
+        refresh_calls.append(1)
+
+    device.async_load_mard = _fake_load_mard  # type: ignore[method-assign]
+
+    # Stub the shadow read to return a *changed* Robot_Room_List on the
+    # next update. Reuse the test fixture's reported dict shape.
+    updated = deepcopy(SKEGOX_DEVICE_DATA)
+    updated["shadow"]["properties"]["reported"]["Robot_Room_List"] = (
+        "FLOOR_X:NewName:Kitchen"
+    )
+
+    async def _fake_get_device_state(household_id: str, device_snd: str) -> dict:
+        return updated
+
+    device._api.async_get_device_state = _fake_get_device_state  # type: ignore[method-assign]
+
+    await device.async_update()
+
+    assert len(refresh_calls) == 1
+
+
+async def test_skegox_update_no_mard_refetch_when_room_list_unchanged() -> None:
+    """Steady-state polls skip the MARD refetch.
+
+    Every 30s the coordinator calls async_update; without this guard
+    we'd hit the property-files endpoint every time and burn API quota
+    for no benefit.
+    """
+    device = SkegoxDevice(MockSkegoxApi(), "household", deepcopy(SKEGOX_DEVICE_DATA))
+    device.properties_full["Robot_Room_List"] = {
+        "value": "FLOOR_X:Kitchen",
+        "read_only": True,
+        "base_type": "str",
+    }
+
+    refresh_calls: list[int] = []
+
+    async def _fake_load_mard() -> None:
+        refresh_calls.append(1)
+
+    device.async_load_mard = _fake_load_mard  # type: ignore[method-assign]
+
+    # Return a shadow whose Robot_Room_List matches the baseline.
+    same = deepcopy(SKEGOX_DEVICE_DATA)
+    same["shadow"]["properties"]["reported"]["Robot_Room_List"] = "FLOOR_X:Kitchen"
+
+    async def _fake_get_device_state(household_id: str, device_snd: str) -> dict:
+        return same
+
+    device._api.async_get_device_state = _fake_get_device_state  # type: ignore[method-assign]
+
+    await device.async_update()
+
+    assert refresh_calls == []
+
+
 async def test_skegox_clean_rooms_falls_back_to_v3_when_v2_absent() -> None:
     """Devices without V2 still get the guessed V3 payload as a fallback.
 

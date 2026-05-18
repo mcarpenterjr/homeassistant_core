@@ -548,19 +548,27 @@ async def test_skegox_clean_rooms_prefers_v2_when_both_keys_present() -> None:
         "base_type": "str",
     }
 
-    captured: dict[str, Any] = {}
+    captured: list[dict[str, Any]] = []
 
-    async def _capture(property_name: Any, value: Any) -> None:
-        captured.setdefault(property_name, value)
+    async def _capture(household_id: str, device_snd: str, desired: dict) -> None:
+        captured.append(desired)
 
-    device.async_set_property_value = _capture  # type: ignore[method-assign]
+    device._api.async_set_device_properties = _capture  # type: ignore[method-assign]
 
     await device.async_clean_rooms(["Kitchen"])
 
     import json as _json
 
-    assert "AreasToClean_V3" not in captured
-    payload = _json.loads(captured["AreasToClean_V2"])
+    # ONE atomic PATCH carrying both the rooms write and the start command.
+    # Two sequential PATCHes opened a race where Operating_Mode=2 reached
+    # the device before AreasToClean_V2 desired propagated to reported,
+    # which manifested as the device wandering the perimeter instead of
+    # navigating to the requested rooms.
+    assert len(captured) == 1
+    desired = captured[0]
+    assert "AreasToClean_V3" not in desired
+    assert desired["Operating_Mode"] == 2
+    payload = _json.loads(desired["AreasToClean_V2"])
     assert payload["floor_id"] == "FLOOR_MARD"
     # V2 uses the colon-prefixed string-array shape — captured verbatim
     # from the app's actual writes.
@@ -663,17 +671,20 @@ async def test_skegox_clean_rooms_falls_back_to_v3_when_v2_absent() -> None:
     # Ensure V2 is *not* in properties_full — emulate a V3-only shadow.
     device.properties_full.pop("AreasToClean_V2", None)
 
-    captured: dict[str, Any] = {}
+    captured: list[dict[str, Any]] = []
 
-    async def _capture(property_name: Any, value: Any) -> None:
-        captured.setdefault(property_name, value)
+    async def _capture(household_id: str, device_snd: str, desired: dict) -> None:
+        captured.append(desired)
 
-    device.async_set_property_value = _capture  # type: ignore[method-assign]
+    device._api.async_set_device_properties = _capture  # type: ignore[method-assign]
 
     await device.async_clean_rooms(["Kitchen"])
 
     import json as _json
 
-    assert "AreasToClean_V2" not in captured
-    payload = _json.loads(captured["AreasToClean_V3"])
+    assert len(captured) == 1
+    desired = captured[0]
+    assert "AreasToClean_V2" not in desired
+    assert desired["Operating_Mode"] == 2
+    payload = _json.loads(desired["AreasToClean_V3"])
     assert payload["areas_to_clean"] == {"UserRoom": ["AZ_3"]}

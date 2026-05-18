@@ -248,19 +248,27 @@ class SkegoxApi:
     async def async_set_device_property(
         self, household_id: str, device_snd: str, prop_name: str, value: Any
     ) -> None:
-        """Set a device property via PATCH."""
+        """Set a single device property via PATCH."""
+        await self.async_set_device_properties(
+            household_id, device_snd, {prop_name: value}
+        )
+
+    async def async_set_device_properties(
+        self,
+        household_id: str,
+        device_snd: str,
+        desired: dict[str, Any],
+    ) -> None:
+        """Set multiple desired properties atomically in one PATCH.
+
+        AWS-IoT-shaped shadows apply the whole ``desired`` block atomically,
+        so this is the right shape for "set rooms AND start cleaning" where
+        a race between the two writes would make the device misbehave.
+        """
         await self._async_request(
             "PATCH",
             f"/devicesEndUserController/{household_id}/devices/{device_snd}",
-            json_data={
-                "shadow": {
-                    "properties": {
-                        "desired": {
-                            prop_name: value,
-                        }
-                    }
-                }
-            },
+            json_data={"shadow": {"properties": {"desired": desired}}},
         )
 
     async def async_fetch_property_file(
@@ -696,13 +704,14 @@ class SkegoxDevice:
             }
         )
 
+        desired: dict[str, Any]
         if "AreasToClean_V2" in self.properties_full:
-            await self.async_set_property_value("AreasToClean_V2", v2_payload)
+            desired = {"AreasToClean_V2": v2_payload}
         elif "AreasToClean_V3" in self.properties_full:
             # V3 shape is still a guess — preserved as a fallback for any
             # device generation that genuinely uses V3 instead of V2. The
             # captured-from-app evidence so far only covers V2 devices.
-            payload = json.dumps(
+            v3_payload = json.dumps(
                 {
                     "areas_to_clean": {"UserRoom": rooms},
                     "clean_count": 1,
@@ -710,12 +719,35 @@ class SkegoxDevice:
                     "cleantype": clean_type,
                 }
             )
-            await self.async_set_property_value("AreasToClean_V3", payload)
+            desired = {"AreasToClean_V3": v3_payload}
         else:
-            await self.async_set_property_value("Areas_To_Clean", v2_payload)
+            desired = {"Areas_To_Clean": v2_payload}
 
-        # Start cleaning after setting rooms
-        await self.async_set_operating_mode(2)  # OperatingModes.START
+        # Bundle the rooms write + start command into ONE PATCH so the
+        # device receives them atomically. Two sequential PATCHes have a
+        # window where Operating_Mode=2 reaches the device before the
+        # rooms desired hits reported state — the device interprets the
+        # start command with empty/stale rooms and defaults to a
+        # perimeter-bumping wander (the "device gets lost" symptom).
+        desired["Operating_Mode"] = 2  # OperatingModes.START
+        LOGGER.info(
+            "Shark IQ clean_rooms dispatching atomic PATCH for %s: %s",
+            self._snd,
+            desired,
+        )
+        await self._api.async_set_device_properties(
+            self._household_id, self._snd, desired
+        )
+        # Reflect the writes locally so subsequent reads don't see stale state.
+        for key, value in desired.items():
+            if key in self.properties_full:
+                self.properties_full[key]["value"] = value
+            else:
+                self.properties_full[key] = {
+                    "value": value,
+                    "read_only": False,
+                    "base_type": type(value).__name__,
+                }
 
     async def async_update(
         self, property_list: Any | None = None

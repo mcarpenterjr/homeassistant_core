@@ -213,12 +213,13 @@ class SharkVacuumEntity(CoordinatorEntity[SharkIqUpdateCoordinator], StateVacuum
         on state. The behavior is contextual; the label stays "Start".
         """
         selected = self._read_selected_rooms()
+        LOGGER.info(
+            "Shark IQ Start pressed for %s: %d room switch(es) on -> %s",
+            self.entity_id,
+            len(selected),
+            selected or "(no selection, full clean)",
+        )
         if selected:
-            LOGGER.debug(
-                "Start pressed with %d room(s) selected; routing to clean_room: %s",
-                len(selected),
-                selected,
-            )
             await self.async_clean_room(rooms=selected)
             await self._reset_selected_switches()
             return
@@ -243,11 +244,13 @@ class SharkVacuumEntity(CoordinatorEntity[SharkIqUpdateCoordinator], StateVacuum
         entry_id = self.coordinator.config_entry.entry_id
         prefix = f"{serial}_select_"
 
+        display_rooms = getattr(self.sharkiq, "display_rooms", None) or {}
         slug_to_room: dict[str, str] = {
-            slugify(name): name
-            for name in (getattr(self.sharkiq, "display_rooms", None) or {})
+            slugify(name): name for name in display_rooms
         }
 
+        switches_on: list[str] = []
+        orphans: list[str] = []
         rooms: list[str] = []
         for entry in er.async_entries_for_config_entry(registry, entry_id):
             if entry.domain != "switch":
@@ -258,17 +261,26 @@ class SharkVacuumEntity(CoordinatorEntity[SharkIqUpdateCoordinator], StateVacuum
             state = self.hass.states.get(entry.entity_id)
             if state is None or state.state != "on":
                 continue
+            switches_on.append(entry.entity_id)
             slug = unique_id[len(prefix) :]
             room = slug_to_room.get(slug)
             if room is None:
-                # Stale switch whose room was removed/renamed since setup;
-                # skip rather than crash the start.
-                LOGGER.debug(
-                    "Ignoring orphan select switch %s (no matching MARD room)",
-                    entry.entity_id,
-                )
+                orphans.append(f"{entry.entity_id} (slug={slug!r})")
                 continue
             rooms.append(room)
+
+        # INFO-level so the empty-rooms failure mode shows up without
+        # extra config. If switches are on but display_rooms is empty
+        # (eg MARD didn't load), every switch will appear under orphans
+        # — that's the signal to fix MARD, not the switches.
+        LOGGER.info(
+            "Shark IQ _read_selected_rooms: display_rooms=%d entries; "
+            "switches on=%s; orphans=%s; resolved rooms=%s",
+            len(display_rooms),
+            switches_on or "[]",
+            orphans or "[]",
+            rooms or "[]",
+        )
         return rooms
 
     async def _reset_selected_switches(self) -> None:

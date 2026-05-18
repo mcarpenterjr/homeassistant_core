@@ -696,6 +696,24 @@ class SkegoxDevice:
         if not floor_id and room_list and ":" in room_list:
             floor_id = room_list.split(":")[0]
 
+        # Diagnostic: surface which AreasToClean keys we know about so a
+        # mis-routed PATCH (writing legacy when V2 is the active channel)
+        # is debuggable from the log without re-running a shadow probe.
+        present = {
+            k: ("AreasToClean_V3" in self.properties_full, k in self.properties_full)
+            for k in ("AreasToClean_V2", "AreasToClean_V3", "Areas_To_Clean")
+        }
+        LOGGER.info(
+            "Shark IQ clean_rooms %s: input rooms=%s, floor_id=%r, "
+            "AreasToClean keys present: V2=%s V3=%s legacy=%s",
+            self._snd,
+            rooms,
+            floor_id,
+            "AreasToClean_V2" in self.properties_full,
+            "AreasToClean_V3" in self.properties_full,
+            "Areas_To_Clean" in self.properties_full,
+        )
+
         v2_payload = json.dumps(
             {
                 "floor_id": floor_id,

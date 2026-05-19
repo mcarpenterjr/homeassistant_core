@@ -671,14 +671,27 @@ class SkegoxDevice:
         entries (merged areas), all underlying names are expanded into the
         payload so the robot cleans the full merged area.
 
-        Wire format preference is **V2 first**, then V3, then the legacy
-        ``Areas_To_Clean`` blob. A live capture of what the SharkClean app
-        writes when starting a room clean confirmed V2 is the active
-        channel on current-gen devices, with V3 present in the shadow but
-        unused (``reported = None`` / ``desired = None``). Earlier code
-        guessed at V3's shape and wrote there preferentially, which the
-        device ignored — that's the "gets lost" symptom users see when
-        HA-issued room cleans don't behave like app-issued ones.
+        **Regression-resistance notes** — these are the wire-format
+        invariants we learned the hard way against this device line, by
+        capturing the SharkClean app's actual shadow writes and observing
+        the device's reported-state acknowledgements. Don't "simplify"
+        any of them without re-capturing first:
+
+        1. **Atomic PATCH.** Rooms and ``Operating_Mode=2`` go in a single
+           shadow update. Two sequential PATCHes opened a race where the
+           start command reached the device with the old rooms desired
+           still in flight; the device defaulted to a perimeter wander.
+        2. **Dual-write V2 + legacy.** When ``AreasToClean_V2`` exists in
+           the shadow we write the **same** payload to both
+           ``AreasToClean_V2`` and the legacy ``Areas_To_Clean`` in that
+           PATCH. Writing only V2 left the device unable to acknowledge
+           the rooms — its V2 ``reported`` stayed pinned at ``'*'`` and
+           the robot edge-bumped instead of navigating. The SharkClean
+           app sets both; shark2mqtt sets only the legacy and reportedly
+           works. Set both.
+        3. **V3 is a fallback only.** V3 is currently a guess (no live
+           capture exists). Only used when neither V2 nor legacy is in
+           the shadow at all.
 
         V2 / legacy payload shape::
 
@@ -687,8 +700,7 @@ class SkegoxDevice:
              "clean_count": 1}
 
         ``clean_type`` has no slot in V2; it's passed through for the V3
-        fallback path, where we still guess the shape but at least won't
-        block the V2-only majority case.
+        fallback path, where we still guess the shape.
         """
         rooms = self._expand_display_rooms(rooms)
         room_list = self.get_property_value("Robot_Room_List")
@@ -696,14 +708,11 @@ class SkegoxDevice:
         if not floor_id and room_list and ":" in room_list:
             floor_id = room_list.split(":")[0]
 
-        # Diagnostic: surface which AreasToClean keys we know about so a
-        # mis-routed PATCH (writing legacy when V2 is the active channel)
-        # is debuggable from the log without re-running a shadow probe.
-        present = {
-            k: ("AreasToClean_V3" in self.properties_full, k in self.properties_full)
-            for k in ("AreasToClean_V2", "AreasToClean_V3", "Areas_To_Clean")
-        }
-        LOGGER.info(
+        # Diagnostic kept at DEBUG so a future ``logger: debug`` flips it
+        # on without a code change. Surfaces which AreasToClean keys we
+        # know about; if a regression ever re-routes to the wrong key,
+        # this line tells us which.
+        LOGGER.debug(
             "Shark IQ clean_rooms %s: input rooms=%s, floor_id=%r, "
             "AreasToClean keys present: V2=%s V3=%s legacy=%s",
             self._snd,
@@ -756,7 +765,7 @@ class SkegoxDevice:
         # start command with empty/stale rooms and defaults to a
         # perimeter-bumping wander (the "device gets lost" symptom).
         desired["Operating_Mode"] = 2  # OperatingModes.START
-        LOGGER.info(
+        LOGGER.debug(
             "Shark IQ clean_rooms dispatching atomic PATCH for %s: %s",
             self._snd,
             desired,

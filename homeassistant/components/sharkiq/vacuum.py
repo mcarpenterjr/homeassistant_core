@@ -213,7 +213,7 @@ class SharkVacuumEntity(CoordinatorEntity[SharkIqUpdateCoordinator], StateVacuum
         on state. The behavior is contextual; the label stays "Start".
         """
         selected = self._read_selected_rooms()
-        LOGGER.info(
+        LOGGER.debug(
             "Shark IQ Start pressed for %s: %d room switch(es) on -> %s",
             self.entity_id,
             len(selected),
@@ -269,11 +269,11 @@ class SharkVacuumEntity(CoordinatorEntity[SharkIqUpdateCoordinator], StateVacuum
                 continue
             rooms.append(room)
 
-        # INFO-level so the empty-rooms failure mode shows up without
-        # extra config. If switches are on but display_rooms is empty
-        # (eg MARD didn't load), every switch will appear under orphans
-        # — that's the signal to fix MARD, not the switches.
-        LOGGER.info(
+        # DEBUG: retained as a diagnostic. The empty-rooms failure mode
+        # (every switch shows up as an orphan because display_rooms is
+        # empty) is the signal that MARD didn't load — kept here so a
+        # future ``logger: debug`` flips it on without a code change.
+        LOGGER.debug(
             "Shark IQ _read_selected_rooms: display_rooms=%d entries; "
             "switches on=%s; orphans=%s; resolved rooms=%s",
             len(display_rooms),

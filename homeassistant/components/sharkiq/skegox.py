@@ -722,14 +722,22 @@ class SkegoxDevice:
             }
         )
 
-        desired: dict[str, Any]
+        desired: dict[str, Any] = {}
         if "AreasToClean_V2" in self.properties_full:
-            desired = {"AreasToClean_V2": v2_payload}
+            # Captured-from-app evidence shows the SharkClean app writes
+            # **both** AreasToClean_V2 *and* the legacy ``Areas_To_Clean``
+            # key in the same shadow PATCH. Writing only V2 left the
+            # device unable to ack the rooms (V2 reported stuck at ``'*'``)
+            # and the robot wandered the perimeter on every HA-issued
+            # clean. Mirroring the dual-write fixes the navigation and
+            # matches the shark2mqtt path (which writes only the legacy
+            # key and is also reported to work on this device generation).
+            desired["AreasToClean_V2"] = v2_payload
+            desired["Areas_To_Clean"] = v2_payload
         elif "AreasToClean_V3" in self.properties_full:
-            # V3 shape is still a guess — preserved as a fallback for any
-            # device generation that genuinely uses V3 instead of V2. The
-            # captured-from-app evidence so far only covers V2 devices.
-            v3_payload = json.dumps(
+            # V3 shape is still a guess — only used when V2 isn't in the
+            # shadow at all. No live capture of a V3 device exists yet.
+            desired["AreasToClean_V3"] = json.dumps(
                 {
                     "areas_to_clean": {"UserRoom": rooms},
                     "clean_count": 1,
@@ -737,9 +745,9 @@ class SkegoxDevice:
                     "cleantype": clean_type,
                 }
             )
-            desired = {"AreasToClean_V3": v3_payload}
         else:
-            desired = {"Areas_To_Clean": v2_payload}
+            # Pre-V2 legacy-only device.
+            desired["Areas_To_Clean"] = v2_payload
 
         # Bundle the rooms write + start command into ONE PATCH so the
         # device receives them atomically. Two sequential PATCHes have a

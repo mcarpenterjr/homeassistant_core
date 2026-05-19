@@ -559,21 +559,25 @@ async def test_skegox_clean_rooms_prefers_v2_when_both_keys_present() -> None:
 
     import json as _json
 
-    # ONE atomic PATCH carrying both the rooms write and the start command.
-    # Two sequential PATCHes opened a race where Operating_Mode=2 reached
-    # the device before AreasToClean_V2 desired propagated to reported,
-    # which manifested as the device wandering the perimeter instead of
-    # navigating to the requested rooms.
+    # ONE atomic PATCH carrying the rooms write *and* the start command.
+    # The captured-from-app wire format updates both AreasToClean_V2 and
+    # the legacy Areas_To_Clean in the same shadow update; writing only
+    # V2 left the device unable to ack the rooms (V2 reported stuck at
+    # ``'*'``) and the robot wandered the perimeter on every HA-issued
+    # clean. Dual-write fixes the navigation.
     assert len(captured) == 1
     desired = captured[0]
     assert "AreasToClean_V3" not in desired
     assert desired["Operating_Mode"] == 2
-    payload = _json.loads(desired["AreasToClean_V2"])
-    assert payload["floor_id"] == "FLOOR_MARD"
-    # V2 uses the colon-prefixed string-array shape — captured verbatim
-    # from the app's actual writes.
-    assert payload["areas_to_clean"] == ["UserRoom:AZ_3", "UserRoom:AZ_4"]
-    assert payload["clean_count"] == 1
+
+    expected_areas = ["UserRoom:AZ_3", "UserRoom:AZ_4"]
+    v2_payload = _json.loads(desired["AreasToClean_V2"])
+    legacy_payload = _json.loads(desired["Areas_To_Clean"])
+    assert v2_payload["floor_id"] == "FLOOR_MARD"
+    assert v2_payload["areas_to_clean"] == expected_areas
+    assert v2_payload["clean_count"] == 1
+    # The legacy key gets the same payload — mirrors the app exactly.
+    assert legacy_payload == v2_payload
 
 
 async def test_skegox_update_refetches_mard_when_room_list_changes() -> None:

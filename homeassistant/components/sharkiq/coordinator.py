@@ -184,9 +184,19 @@ class SharkIqUpdateCoordinator(DataUpdateCoordinator[bool]):
         """Update via the skegox backend."""
         assert self.skegox_api is not None
         try:
-            # Refresh auth if needed
+            # Refresh auth if needed. SharkNinja's Auth0 tenant has rotating
+            # refresh tokens, so we persist after every refresh — without
+            # this, an HA restart later in the session boots holding the
+            # *original* refresh token (which Auth0 has since invalidated),
+            # forcing a reauth that should never have been needed.
             if self.skegox_api.auth.token_expiring_soon:
                 await self.skegox_api.auth.async_refresh_auth()
+                # Late import to avoid the __init__ → coordinator cycle.
+                from . import _persist_tokens
+
+                _persist_tokens(
+                    self.hass, self.config_entry, self.skegox_api.auth
+                )
 
             # Get device connection status
             all_vacuums = await self.skegox_api.async_list_devices()
